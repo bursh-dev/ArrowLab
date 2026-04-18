@@ -23,10 +23,10 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Data — keep folder structure, ignore media payloads
-data/raw/**
+# Data
+# raw/: media ignored via global extensions below; annotations tracked.
+# processed/: everything ignored (derived artifacts) except .gitkeep
 data/processed/**
-!data/raw/.gitkeep
 !data/processed/.gitkeep
 
 # Common media
@@ -37,3 +37,6 @@ data/processed/**
 *.wav
 *.mp3
 *.flac
+*.jpg
+*.jpeg
+*.png

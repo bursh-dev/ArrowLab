@@ -1,0 +1,118 @@
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: #1b1b1f;
+  color: #e0e0e0;
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.5rem 1rem;
+  background: #121216;
+  border-bottom: 1px solid #333;
+}
+
+header h1 { margin: 0; font-size: 1.1rem; letter-spacing: 0.05em; }
+
+.controls { display: flex; gap: 0.5rem; align-items: center; }
+.controls a { color: #8ab4f8; text-decoration: none; font-size: 0.9rem; }
+.controls a:hover { text-decoration: underline; }
+.controls select { padding: 0.3rem; background: #222; color: #eee; border: 1px solid #444; }
+.controls button, .modes button, .shot-controls button, .transport button, .danger button {
+  padding: 0.35rem 0.75rem;
+  background: #2b2b33;
+  border: 1px solid #444;
+  color: #eee;
+  cursor: pointer;
+  border-radius: 3px;
+  font-size: 0.9rem;
+}
+.controls button:hover, .modes button:hover, .shot-controls button:hover, .transport button:hover { background: #3a3a44; }
+
+#status { font-size: 0.85rem; color: #8ab4f8; margin-left: 0.5rem; min-width: 6rem; }
+
+main {
+  display: grid;
+  grid-template-columns: 1fr 360px;
+  gap: 1rem;
+  padding: 1rem;
+}
+
+.stage { display: flex; flex-direction: column; gap: 0.5rem; }
+
+.video-wrap {
+  position: relative;
+  display: inline-block;
+  background: #000;
+  line-height: 0;
+  max-width: 100%;
+}
+.video-wrap video {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+.video-wrap canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: auto;
+  cursor: crosshair;
+}
+
+.seek {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+}
+.seek input[type=range] { flex: 1; height: 1.2rem; }
+.seek .time { font-family: ui-monospace, monospace; font-size: 0.9rem; min-width: 10rem; text-align: right; }
+
+.transport {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.transport .goto { display: flex; gap: 0.3rem; align-items: center; font-size: 0.85rem; }
+.transport .goto input { width: 6rem; padding: 0.2rem; background: #222; color: #eee; border: 1px solid #444; }
+.frame-info { margin-left: auto; font-family: ui-monospace, monospace; font-size: 0.9rem; }
+
+.panel {
+  background: #202028;
+  border: 1px solid #333;
+  padding: 0.75rem;
+  border-radius: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.panel h2 { margin: 0.5rem 0 0; font-size: 0.85rem; letter-spacing: 0.1em; color: #8a8aa0; text-transform: uppercase; }
+
+.modes, .shot-controls { display: flex; flex-direction: column; gap: 0.4rem; }
+.modes button.active { background: #4a5d8a; border-color: #6a8ac8; }
+.shot-controls.hidden { display: none; }
+
+.meta label { display: flex; gap: 0.5rem; align-items: center; font-size: 0.9rem; }
+.meta input { width: 5rem; padding: 0.2rem; background: #222; color: #eee; border: 1px solid #444; }
+
+pre#annotationView {
+  background: #121216;
+  border: 1px solid #2a2a34;
+  padding: 0.5rem;
+  border-radius: 3px;
+  font-size: 0.8rem;
+  overflow: auto;
+  max-height: 14rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.danger button { background: #512d2d; border-color: #7a3a3a; color: #ffbebe; }
+.danger button:hover { background: #6a3b3b; }

@@ -1,0 +1,43 @@
+videos:
+  video_2026-04-17_19-28-03.mp4:
+    corridor:
+      y_top: 651
+      y_bottom: 1065
+    target:
+      cx: 1522
+      cy: 825
+      r: 38
+      bbox:
+      - 1445
+      - 680
+      - 1651
+      - 1002
+      face_diameter_m: 0.4
+    shots:
+    - flight_window:
+      - 19261
+      - 19289
+    - flight_window:
+      - 23236
+      - 23261
+    - flight_window:
+      - 27959
+      - 27987
+    - flight_window:
+      - 32538
+      - 32571
+  video_2026-04-18_11-05-38.mp4:
+    corridor:
+      y_top: 556
+      y_bottom: 840
+    target:
+      cx: 1748
+      cy: 678
+      r: 28
+      bbox:
+      - 1665
+      - 575
+      - 1843
+      - 784
+      face_diameter_m: 0.4
+    shots: []
