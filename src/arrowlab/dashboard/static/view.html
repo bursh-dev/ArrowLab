@@ -8,41 +8,47 @@
   <link rel="stylesheet" href="/static/view.css" />
 </head>
 <body>
-  <header>
-    <h1>ArrowLab view</h1>
+  <header class="view-header">
+    <h1>ArrowLab</h1>
     <nav class="controls">
       <a href="/">← Annotate</a>
-      <label>Video:
-        <select id="videoSelect"></select>
-      </label>
-      <button id="refreshBtn">Refresh</button>
-      <button id="playAllBtn">Play all</button>
-      <button id="pauseAllBtn">Pause all</button>
       <span id="status"></span>
     </nav>
   </header>
 
   <main class="view-main">
-    <section class="row live">
-      <h2>Live session</h2>
-      <div class="live-bar">
-        <div class="live-meta">
-          <span>Phone: <span id="phoneStatus" class="pill bad">none</span></span>
-          <span>Session: <span id="sessionStatus" class="pill bad">none</span></span>
-          <span>Calibrated: <span id="calibStatus" class="pill bad">no</span></span>
-          <span id="shotCount">0 shots</span>
-        </div>
-        <button id="startSessionBtn" class="end-btn">Start session</button>
-        <button id="endSessionBtn" class="end-btn" disabled>End session</button>
-        <button id="captureFrameBtn" class="end-btn" disabled>Start calibration (grab frame)</button>
-        <button id="shotBtn" class="shot-btn" disabled>SHOT!</button>
+    <div class="status-bar">
+      <span>Phone: <span id="phoneStatus" class="pill bad">none</span></span>
+      <span>Session: <span id="sessionStatus" class="pill bad">none</span></span>
+      <span>Calibrated: <span id="calibStatus" class="pill bad">no</span></span>
+      <span id="shotCount" class="shot-count">0 shots</span>
+    </div>
+
+    <nav class="tabs" id="tabs">
+      <button data-tab="session" class="active">Session</button>
+      <button data-tab="calibrate">Calibrate</button>
+      <button data-tab="shoot">Shoot</button>
+    </nav>
+
+    <!-- SESSION TAB -->
+    <section class="tab-panel active" data-tab="session">
+      <div class="session-actions">
+        <button id="startSessionBtn">Start session</button>
+        <button id="endSessionBtn" disabled>End session</button>
+      </div>
+    </section>
+
+    <!-- CALIBRATE TAB -->
+    <section class="tab-panel" data-tab="calibrate">
+      <div class="calib-actions">
+        <button id="captureFrameBtn" disabled>Grab calibration frame</button>
       </div>
 
       <div id="fakeSourceArea" class="fake-source-area hidden">
         <div class="fake-source-head">
           <span>Fake-phone source:</span>
           <code id="fakeSourceName"></code>
-          <button id="fakeCaptureBtn" class="end-btn">Use this frame for calibration</button>
+          <button id="fakeCaptureBtn">Use this frame</button>
         </div>
         <video id="fakeSourceVideo" controls preload="metadata"></video>
       </div>
@@ -57,8 +63,8 @@
           <label>Face diameter (m):
             <input id="calibFaceDiameter" type="number" step="0.01" value="0.40" />
           </label>
-          <button id="saveCalibBtn" class="end-btn" disabled>Save calibration</button>
-          <button id="clearCalibBtn" class="end-btn">Clear</button>
+          <button id="saveCalibBtn" disabled>Save calibration</button>
+          <button id="clearCalibBtn">Clear</button>
         </div>
         <div class="calib-stage">
           <img id="calibImage" alt="calibration frame" />
@@ -66,27 +72,43 @@
         </div>
         <pre id="calibAnnotationView"></pre>
       </div>
+    </section>
 
-      <div class="live-stack">
-        <video id="liveCombined" controls muted></video>
-        <div id="liveLog"></div>
+    <!-- SHOOT TAB -->
+    <section class="tab-panel" data-tab="shoot">
+      <div class="shoot-actions">
+        <button id="shotBtn" class="shot-btn" disabled>SHOT!</button>
+        <button id="playAllBtn" disabled>▶ Play</button>
+        <button id="pauseAllBtn" disabled>⏸ Pause</button>
+        <span class="shoot-hint">calibration required before shooting</span>
+      </div>
+
+      <div id="lastShot" class="last-shot hidden">
+        <div class="shot-videos">
+          <figure>
+            <video id="lastShotClip" controls muted preload="metadata"></video>
+            <figcaption>raw clip (shot <span id="lastShotNum">?</span>)</figcaption>
+          </figure>
+          <figure>
+            <video id="lastShotTracked" controls muted preload="metadata"></video>
+            <figcaption>tracked</figcaption>
+          </figure>
+        </div>
+      </div>
+
+      <div class="telemetry-wrap">
+        <div class="telemetry-head">
+          <h3>Telemetry</h3>
+          <span id="telemetryInfo"></span>
+        </div>
+        <canvas id="telemetryCanvas"></canvas>
       </div>
     </section>
 
-    <section class="row">
-      <h2>Shot clips (raw, padded)</h2>
-      <div class="row-grid" id="clipsRow"></div>
-    </section>
-    <section class="row">
-      <h2>Tracked (detection overlay)</h2>
-      <div class="row-grid" id="trackedRow"></div>
-    </section>
-    <section class="row combined">
-      <h2>Combined synth</h2>
-      <div id="combinedWrap">
-        <video id="combinedVideo" controls></video>
-      </div>
-    </section>
+    <details class="log-panel">
+      <summary>Log</summary>
+      <div id="liveLog"></div>
+    </details>
   </main>
 
   <script src="/static/view.js"></script>

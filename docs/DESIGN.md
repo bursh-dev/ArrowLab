@@ -273,6 +273,17 @@ Near-term milestones in order of intended work:
   calibration JPEG so the operator can verify the annotation before doing a
   full set.
 
+### M8 — Laptop-connected camera as an alternative transport
+- Optional non-phone capture path: a GoPro in webcam mode (or similar USB/HDMI
+  high-speed camera) feeds frames directly into the laptop.
+- `scripts/laptop_camera.py` opens `cv2.VideoCapture`, holds a rolling buffer,
+  and on `trigger_shot` pushes a 6 s mp4 straight into `_process_shot` — no
+  `/ws/phone` or `/api/shot` round-trip needed.
+- Server gets a `--source=phone|webcam` flag (or auto-detects). Same pipeline,
+  same annotation flow, just a different ingest. Useful when a better sensor
+  than a phone is available, or for research-grade 500+ fps via machine vision
+  cameras.
+
 ---
 
 ## 10. Open questions

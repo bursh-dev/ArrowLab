@@ -174,7 +174,8 @@ def _new_session() -> dict:
         "calibration_frame": None,  # relative URL once JPEG uploaded
         "annotation": None,          # {corridor, target} once saved
         "shot_count": 0,
-        "trajectories": [],
+        "trajectories": [],          # list of Path to per-shot trajectory yaml
+        "shots": [],                 # list of shot_ready payload dicts (for view replay)
         "fake_source": None,         # filename hint advertised by fake phone for the scrubber
     }
 
@@ -329,6 +330,11 @@ async def ws_view(ws: WebSocket) -> None:
     await ws.accept()
     LIVE_STATE["view_wss"].append(ws)
     await ws.send_json({"type": "state", **_session_snapshot()})
+    # Replay previously processed shots for late-joining views
+    s = LIVE_STATE["session"]
+    if s is not None:
+        for shot in s.get("shots", []):
+            await ws.send_json(shot)
     try:
         while True:
             msg = await ws.receive_json()
@@ -383,15 +389,15 @@ async def api_shot(request: Request) -> dict:
     slice_path = DATA_RAW / "sessions" / f"{s['stem']}_shot{n:02d}.mp4"
     slice_path.parent.mkdir(parents=True, exist_ok=True)
     slice_path.write_bytes(data)
-    rel = slice_path.relative_to(PROJECT_ROOT).as_posix()
+    clip_url = "/videos/" + slice_path.relative_to(DATA_RAW).as_posix()
     await _broadcast_view({
         "type": "shot_uploaded",
         "shot": n,
         "bytes": len(data),
-        "slice": rel,
+        "clip_url": clip_url,
     })
     asyncio.create_task(_process_shot(slice_path, n, s))
-    return {"ok": True, "shot_id": n, "slice_path": rel}
+    return {"ok": True, "shot_id": n, "clip_url": clip_url}
 
 
 async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
@@ -403,8 +409,6 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
     def _work() -> dict | None:
         import cv2
         from arrowlab.video.live_sim import auto_detect_flight_in_clip
-        from arrowlab.video.synth import render as synth_render
-        from arrowlab.video.synth_combined import render_combined
         from arrowlab.video.track import build_roi_mask, track_clip
 
         cap = cv2.VideoCapture(str(slice_path))
@@ -423,7 +427,7 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
         if detected is None:
             return None
         a, b = detected
-        traj = track_clip(
+        traj_path = track_clip(
             slice_path, annotation, a + 1, b + 1,
             clip_start_frame=1, clip_end_frame=len(frames),
             output_stem=slice_path.stem,
@@ -431,20 +435,21 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
             shot_index=n - 1,
             log_prefix=f"[live] shot {n}",
         )
-        synth_out = DATA_PROCESSED / "synth" / f"{slice_path.stem}_synth.mp4"
-        synth_render(traj, synth_out)
-        session["trajectories"].append(traj)
-        combined_rel = None
-        if len(session["trajectories"]) >= 2:
-            combined_path = DATA_PROCESSED / "synth" / f"{session['stem']}_combined.mp4"
-            render_combined(session["trajectories"], combined_path)
-            combined_rel = "/processed/" + combined_path.relative_to(DATA_PROCESSED).as_posix()
-        tracked_rel = "/processed/" + (DATA_PROCESSED / "tracked" / f"{slice_path.stem}_tracked.mp4").relative_to(DATA_PROCESSED).as_posix()
-        synth_rel = "/processed/" + synth_out.relative_to(DATA_PROCESSED).as_posix()
-        return {"tracked": tracked_rel, "synth": synth_rel, "combined": combined_rel}
+        session["trajectories"].append(traj_path)
+        with open(traj_path) as f:
+            trajectory = yaml.safe_load(f)
+        tracked_url = "/processed/" + (DATA_PROCESSED / "tracked" / f"{slice_path.stem}_tracked.mp4").relative_to(DATA_PROCESSED).as_posix()
+        clip_url = "/videos/" + slice_path.relative_to(DATA_RAW).as_posix()
+        return {
+            "tracked_url": tracked_url,
+            "clip_url": clip_url,
+            "trajectory": trajectory,
+        }
 
     result = await run_in_threadpool(_work)
     if result is None:
         await _broadcast_view({"type": "shot_failed", "shot": n, "reason": "no flight detected"})
     else:
-        await _broadcast_view({"type": "shot_ready", "shot": n, **result})
+        payload = {"type": "shot_ready", "shot": n, **result}
+        session["shots"].append(payload)
+        await _broadcast_view(payload)

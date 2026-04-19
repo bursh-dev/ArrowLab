@@ -1,86 +1,33 @@
 "use strict";
 
-// ==== Video browser (pre-existing, unchanged) ==============================
+// ==== Generic status ======================================================
 
-const videoSelect = document.getElementById("videoSelect");
-const clipsRow = document.getElementById("clipsRow");
-const trackedRow = document.getElementById("trackedRow");
-const combinedVideo = document.getElementById("combinedVideo");
 const statusEl = document.getElementById("status");
-
 function setStatus(msg, isError = false) {
   statusEl.textContent = msg;
   statusEl.style.color = isError ? "#ff8a8a" : "#8ab4f8";
   if (msg) setTimeout(() => { if (statusEl.textContent === msg) statusEl.textContent = ""; }, 3500);
 }
 
-async function loadVideos() {
-  const list = await (await fetch("/api/videos")).json();
-  videoSelect.innerHTML = "";
-  for (const name of list) {
-    const opt = document.createElement("option");
-    opt.value = name;
-    opt.textContent = name;
-    videoSelect.appendChild(opt);
-  }
-  if (list.length) await selectVideo(list[0]);
-}
+// ==== Tabs ================================================================
 
-function renderRow(row, paths) {
-  row.innerHTML = "";
-  if (!paths || !paths.length) {
-    row.innerHTML = '<div style="color:#666;font-style:italic;grid-column:1/-1;">nothing processed yet</div>';
-    return;
-  }
-  for (const p of paths) {
-    const name = p.split("/").pop();
-    const fig = document.createElement("figure");
-    const vid = document.createElement("video");
-    vid.src = p;
-    vid.controls = true;
-    vid.preload = "metadata";
-    vid.muted = true;
-    const cap = document.createElement("figcaption");
-    cap.textContent = name;
-    fig.appendChild(vid);
-    fig.appendChild(cap);
-    row.appendChild(fig);
+const tabButtons = document.querySelectorAll("#tabs button");
+const tabPanels = document.querySelectorAll(".tab-panel");
+let currentTab = "session";
+
+function activateTab(name) {
+  if (currentTab === name) return;
+  currentTab = name;
+  for (const b of tabButtons) b.classList.toggle("active", b.dataset.tab === name);
+  for (const p of tabPanels) p.classList.toggle("active", p.dataset.tab === name);
+  if (name === "shoot") {
+    // Canvas size depends on visibility; resize now that it's visible.
+    requestAnimationFrame(sizeCanvas);
   }
 }
+for (const b of tabButtons) b.addEventListener("click", () => activateTab(b.dataset.tab));
 
-async function selectVideo(name) {
-  const data = await (await fetch(`/api/view?video=${encodeURIComponent(name)}`)).json();
-  renderRow(clipsRow, data.shot_clips);
-  renderRow(trackedRow, data.tracked);
-  if (data.combined) {
-    combinedVideo.src = data.combined;
-    combinedVideo.style.display = "";
-  } else {
-    combinedVideo.removeAttribute("src");
-    combinedVideo.load();
-    combinedVideo.style.display = "none";
-    setStatus("combined synth not rendered yet", true);
-  }
-}
-
-function allVideos() {
-  return document.querySelectorAll("video");
-}
-
-document.getElementById("playAllBtn").addEventListener("click", () => {
-  for (const v of allVideos()) {
-    v.currentTime = 0;
-    v.play().catch(() => {});
-  }
-});
-document.getElementById("pauseAllBtn").addEventListener("click", () => {
-  for (const v of allVideos()) v.pause();
-});
-document.getElementById("refreshBtn").addEventListener("click", loadVideos);
-
-videoSelect.addEventListener("change", () => selectVideo(videoSelect.value));
-
-// ==== Live session (WS-driven) =============================================
+// ==== Live session DOM ====================================================
 
 const phoneStatus = document.getElementById("phoneStatus");
 const sessionStatus = document.getElementById("sessionStatus");
@@ -90,7 +37,6 @@ const startSessionBtn = document.getElementById("startSessionBtn");
 const endSessionBtn = document.getElementById("endSessionBtn");
 const captureFrameBtn = document.getElementById("captureFrameBtn");
 const shotBtn = document.getElementById("shotBtn");
-const liveCombined = document.getElementById("liveCombined");
 const liveLog = document.getElementById("liveLog");
 
 const calibrationArea = document.getElementById("calibrationArea");
@@ -109,6 +55,17 @@ const fakeSourceName = document.getElementById("fakeSourceName");
 const fakeCaptureBtn = document.getElementById("fakeCaptureBtn");
 let currentFakeSource = null;
 
+const lastShot = document.getElementById("lastShot");
+const lastShotClip = document.getElementById("lastShotClip");
+const lastShotTracked = document.getElementById("lastShotTracked");
+const lastShotNum = document.getElementById("lastShotNum");
+
+const telemetryCanvas = document.getElementById("telemetryCanvas");
+const telemetryCtx = telemetryCanvas.getContext("2d");
+const telemetryInfo = document.getElementById("telemetryInfo");
+const playAllBtn = document.getElementById("playAllBtn");
+const pauseAllBtn = document.getElementById("pauseAllBtn");
+
 let liveWS = null;
 let currentCalibUrl = null;
 
@@ -118,6 +75,15 @@ const calib = {
   annotation: { corridor: null, target: null },
   imgLoaded: false,
 };
+
+const shots = [];
+// Index into shots[] for the most recent shot whose trajectory is NOT yet
+// revealed on the static canvas — it only appears while Play is running,
+// trail growing with the video. null when all shots are revealed.
+let pendingShotIdx = null;
+
+// Last seen state, used to decide tab auto-advance
+const lastState = { active: false, has_annotation: false };
 
 function logLive(line, kind = "info") {
   const div = document.createElement("div");
@@ -146,6 +112,7 @@ function applyState(st) {
   captureFrameBtn.disabled = !(st.active && st.phone_connected);
   shotBtn.disabled = !(st.active && st.phone_connected && st.has_annotation);
 
+  // Fake-phone source scrubber (only in calibrate tab content)
   if (st.active && st.fake_source) {
     fakeSourceArea.classList.remove("hidden");
     if (currentFakeSource !== st.fake_source) {
@@ -160,7 +127,11 @@ function applyState(st) {
     fakeSourceVideo.load();
   }
 
-  if (st.active && st.calibration_frame) {
+  // Calibration image + annotation canvas: always live inside the Calibrate tab,
+  // but hidden once an annotation is saved (to de-clutter). Re-opening happens
+  // by tapping Grab calibration frame again (which fires request_calibration_frame
+  // and clears the stored annotation by capturing a fresh frame).
+  if (st.active && st.calibration_frame && !st.has_annotation) {
     calibrationArea.classList.remove("hidden");
     if (currentCalibUrl !== st.calibration_frame) {
       currentCalibUrl = st.calibration_frame;
@@ -176,6 +147,23 @@ function applyState(st) {
     calib.pendingClicks = [];
     calib.annotation = { corridor: null, target: null };
   }
+
+  // Clear shot history + telemetry when session ends
+  if (!st.active) {
+    shots.length = 0;
+    lastShot.classList.add("hidden");
+    lastShotClip.removeAttribute("src"); lastShotClip.load();
+    lastShotTracked.removeAttribute("src"); lastShotTracked.load();
+    telemetryInfo.textContent = "";
+    renderTelemetry();
+  }
+
+  // Auto-advance tabs on state transitions
+  if (!lastState.active && st.active) activateTab("calibrate");
+  else if (lastState.active && !st.active) activateTab("session");
+  else if (!lastState.has_annotation && st.has_annotation) activateTab("shoot");
+  lastState.active = st.active;
+  lastState.has_annotation = !!st.has_annotation;
 
   updateCalibAnnotationView();
 }
@@ -204,13 +192,18 @@ function handleLiveMsg(msg) {
     logLive("calibration frame received", "ok");
   } else if (msg.type === "shot_uploaded") {
     logLive(`shot ${msg.shot}: ${(msg.bytes / 1024 / 1024).toFixed(1)} MB uploaded, processing...`);
-    shotCountEl.textContent = `${msg.shot} shots`;
   } else if (msg.type === "shot_ready") {
     logLive(`shot ${msg.shot}: ready`, "ok");
-    if (msg.combined) {
-      liveCombined.src = msg.combined + "?t=" + Date.now();
-      liveCombined.load();
-    }
+    lastShotNum.textContent = msg.shot;
+    if (msg.clip_url) lastShotClip.src = msg.clip_url + "?t=" + Date.now();
+    if (msg.tracked_url) lastShotTracked.src = msg.tracked_url + "?t=" + Date.now();
+    lastShot.classList.remove("hidden");
+    playAllBtn.disabled = false;
+    pauseAllBtn.disabled = false;
+    shots.push(msg);
+    pendingShotIdx = shots.length - 1;
+    telemetryInfo.textContent = `${shots.length} shot${shots.length === 1 ? "" : "s"} (press Play to reveal)`;
+    sizeCanvas();
   } else if (msg.type === "shot_failed") {
     logLive(`shot ${msg.shot}: FAILED (${msg.reason || "unknown"})`, "error");
   } else if (msg.type === "error") {
@@ -218,38 +211,30 @@ function handleLiveMsg(msg) {
   }
 }
 
-// ---- session buttons ------------------------------------------------------
+// ==== Session control =====================================================
 
 startSessionBtn.addEventListener("click", async () => {
   const res = await fetch("/api/session", { method: "POST" });
-  if (!res.ok) {
-    const body = await res.text();
-    logLive(`start session failed: ${body}`, "error");
-  } else {
-    logLive("session started");
-  }
+  if (!res.ok) logLive(`start session failed: ${await res.text()}`, "error");
+  else logLive("session started");
 });
-
 endSessionBtn.addEventListener("click", async () => {
   if (!confirm("End session? This clears calibration and shot count.")) return;
   await fetch("/api/session/end", { method: "POST" });
   logLive("session ended");
 });
-
 captureFrameBtn.addEventListener("click", () => {
   if (liveWS && liveWS.readyState === WebSocket.OPEN) {
     liveWS.send(JSON.stringify({ type: "request_calibration_frame" }));
     logLive("grabbing fresh calibration frame from phone...");
   }
 });
-
 fakeCaptureBtn.addEventListener("click", () => {
   if (!(liveWS && liveWS.readyState === WebSocket.OPEN)) return;
   const t = fakeSourceVideo.currentTime || 0;
   liveWS.send(JSON.stringify({ type: "request_calibration_frame", at_s: t }));
   logLive(`grabbing calibration frame at t=${t.toFixed(3)}s (fake scrub)...`);
 });
-
 shotBtn.addEventListener("click", () => {
   if (liveWS && liveWS.readyState === WebSocket.OPEN) {
     liveWS.send(JSON.stringify({ type: "trigger_shot" }));
@@ -257,7 +242,7 @@ shotBtn.addEventListener("click", () => {
   }
 });
 
-// ---- calibration annotation ----------------------------------------------
+// ==== Calibration annotation canvas ======================================
 
 calibImage.addEventListener("load", () => {
   calibOverlay.width = calibImage.naturalWidth;
@@ -265,18 +250,15 @@ calibImage.addEventListener("load", () => {
   calib.imgLoaded = true;
   redrawCalib();
 });
-
 for (const btn of calibModeBtns) {
   btn.addEventListener("click", () => setCalibMode(btn.dataset.mode));
 }
-
 function setCalibMode(mode) {
   calib.mode = mode;
   calib.pendingClicks = [];
   for (const b of calibModeBtns) b.classList.toggle("active", b.dataset.mode === mode);
   redrawCalib();
 }
-
 calibOverlay.addEventListener("click", (e) => {
   if (!calib.mode || !calib.imgLoaded) return;
   const rect = calibOverlay.getBoundingClientRect();
@@ -297,10 +279,7 @@ function handleCalibClicks() {
     const [c, edge] = clicks;
     const r = Math.round(Math.hypot(edge.x - c.x, edge.y - c.y));
     const prev = calib.annotation.target || {};
-    calib.annotation.target = {
-      cx: c.x, cy: c.y, r,
-      bbox: prev.bbox || null,
-    };
+    calib.annotation.target = { cx: c.x, cy: c.y, r, bbox: prev.bbox || null };
     calib.pendingClicks = [];
   } else if (calib.mode === "bbox" && clicks.length === 2) {
     const x0 = Math.min(clicks[0].x, clicks[1].x);
@@ -323,7 +302,6 @@ function handleCalibClicks() {
 function redrawCalib() {
   if (!calibOverlay.width) return;
   ctxCalib.clearRect(0, 0, calibOverlay.width, calibOverlay.height);
-
   const a = calib.annotation;
   if (a.corridor) {
     ctxCalib.strokeStyle = "#00e5ff";
@@ -368,21 +346,14 @@ function updateCalibAnnotationView() {
 }
 
 clearCalibBtn.addEventListener("click", async () => {
-  // Wipe the captured frame + saved annotation on the server; the state
-  // broadcast will hide the calibration area and the phone overlay clears via
-  // the `annotation` message.
   const res = await fetch("/api/session/calibration", { method: "DELETE" });
-  if (res.ok) {
-    logLive("calibration cleared", "ok");
-  } else {
-    logLive(`clear failed: ${await res.text()}`, "error");
-  }
+  if (res.ok) logLive("calibration cleared", "ok");
+  else logLive(`clear failed: ${await res.text()}`, "error");
   calib.annotation = { corridor: null, target: null };
   calib.pendingClicks = [];
   redrawCalib();
   updateCalibAnnotationView();
 });
-
 saveCalibBtn.addEventListener("click", async () => {
   if (!calib.annotation.corridor || !calib.annotation.target) return;
   const fd = parseFloat(calibFaceDiameter.value) || 0.40;
@@ -397,5 +368,263 @@ saveCalibBtn.addEventListener("click", async () => {
   else logLive(`save failed: ${await res.text()}`, "error");
 });
 
-loadVideos().catch(e => setStatus(`load failed: ${e}`, true));
+// ==== Telemetry canvas ====================================================
+
+function linearFit(xs, ys) {
+  const n = xs.length;
+  if (n < 2) return null;
+  const mx = xs.reduce((a, b) => a + b, 0) / n;
+  const my = ys.reduce((a, b) => a + b, 0) / n;
+  let num = 0, den = 0;
+  for (let i = 0; i < n; i++) {
+    num += (xs[i] - mx) * (ys[i] - my);
+    den += (xs[i] - mx) * (xs[i] - mx);
+  }
+  if (den <= 0) return null;
+  const slope = num / den;
+  return { slope, intercept: my - slope * mx };
+}
+
+function shotColor(i) {
+  const hue = (i * 55) % 360;
+  return `hsl(${hue}, 80%, 60%)`;
+}
+
+function getViewBox() {
+  const latest = shots[shots.length - 1]?.trajectory;
+  const imgW = latest?.width || 1920;
+  const imgH = latest?.height || 1080;
+  const t = latest?.annotation?.target;
+
+  if (t && t.cx != null && t.cy != null && t.r) {
+    // Span the actual flight horizontally so the arrow is on-canvas the whole
+    // time (same pacing as the videos), but keep vertical zoom tight so small
+    // differences between shots stand out.
+    const r = t.r;
+    let leftExtent = r * 20;
+    for (const shot of shots) {
+      const dets = shot.trajectory?.detections;
+      if (!dets || dets.length === 0) continue;
+      const firstX = dets[0].x;
+      leftExtent = Math.max(leftExtent, (t.cx - firstX) + r * 2);
+    }
+    const right = r * 4;
+    const vert = r * 5;
+    return {
+      x0: Math.max(0, t.cx - leftExtent),
+      y0: Math.max(0, t.cy - vert),
+      x1: Math.min(imgW, t.cx + right),
+      y1: Math.min(imgH, t.cy + vert),
+    };
+  }
+
+  const corridor = latest?.annotation?.corridor;
+  if (corridor) {
+    const band = corridor.y_bottom - corridor.y_top;
+    const pad = Math.round(band * 0.25);
+    return {
+      x0: 0,
+      y0: Math.max(0, corridor.y_top - pad),
+      x1: imgW,
+      y1: Math.min(imgH, corridor.y_bottom + pad),
+    };
+  }
+  return { x0: 0, y0: 0, x1: imgW, y1: imgH };
+}
+
+function sizeCanvas() {
+  const parentW = telemetryCanvas.parentElement.clientWidth || 800;
+  const vb = getViewBox();
+  const aspect = (vb.x1 - vb.x0) / Math.max(1, vb.y1 - vb.y0);
+  const cssW = parentW;
+  const cssH = Math.max(120, Math.min(360, cssW / aspect));
+  telemetryCanvas.style.height = `${Math.round(cssH)}px`;
+  telemetryCanvas.width = Math.round(cssW);
+  telemetryCanvas.height = Math.round(cssH);
+  renderTelemetry();
+}
+window.addEventListener("resize", sizeCanvas);
+
+function shotFit(shot) {
+  const dets = shot.trajectory?.detections || [];
+  if (dets.length < 2) return null;
+  const frames = dets.map(d => d.frame);
+  const fx = linearFit(frames, dets.map(d => d.x));
+  const fy = linearFit(frames, dets.map(d => d.y));
+  if (!fx || !fy) return null;
+  const tx = shot.trajectory?.annotation?.target?.cx;
+  const f0 = frames[0];
+  const fEnd = frames[frames.length - 1];
+  const startX = fx.slope * f0 + fx.intercept;
+  const startY = fy.slope * f0 + fy.intercept;
+  let hitX, hitY, fHit;
+  if (tx != null && Math.abs(fx.slope) > 1e-6) {
+    fHit = (tx - fx.intercept) / fx.slope;
+    hitX = tx;
+    hitY = fy.slope * fHit + fy.intercept;
+  } else {
+    fHit = fEnd;
+    hitX = fx.slope * fHit + fx.intercept;
+    hitY = fy.slope * fHit + fy.intercept;
+  }
+  return { fx, fy, f0, fEnd, fHit, startX, startY, hitX, hitY };
+}
+
+function renderTelemetry(currentTime = null) {
+  const w = telemetryCanvas.width;
+  const h = telemetryCanvas.height;
+  telemetryCtx.fillStyle = "#0a0a0e";
+  telemetryCtx.fillRect(0, 0, w, h);
+
+  if (shots.length === 0) return;
+
+  const latest = shots[shots.length - 1].trajectory;
+  const ann = latest.annotation || {};
+  const vb = getViewBox();
+  const vbW = vb.x1 - vb.x0;
+  const vbH = vb.y1 - vb.y0;
+  const sx = w / vbW;
+  const sy = h / vbH;
+  const sAvg = (sx + sy) / 2;
+  const mapX = (x) => (x - vb.x0) * sx;
+  const mapY = (y) => (y - vb.y0) * sy;
+
+  // Corridor
+  if (ann.corridor) {
+    telemetryCtx.strokeStyle = "#444455";
+    telemetryCtx.lineWidth = 1;
+    telemetryCtx.beginPath();
+    telemetryCtx.moveTo(0, mapY(ann.corridor.y_top));
+    telemetryCtx.lineTo(w, mapY(ann.corridor.y_top));
+    telemetryCtx.stroke();
+    telemetryCtx.beginPath();
+    telemetryCtx.moveTo(0, mapY(ann.corridor.y_bottom));
+    telemetryCtx.lineTo(w, mapY(ann.corridor.y_bottom));
+    telemetryCtx.stroke();
+  }
+
+  // Target face
+  const t = ann.target;
+  if (t && t.r && t.cx != null && t.cy != null) {
+    const cx = mapX(t.cx), cy = mapY(t.cy), rBase = t.r * sAvg;
+    const rings = [
+      [rBase, "#ffffff"],
+      [rBase * 0.75, "#ff4040"],
+      [rBase * 0.5, "#ffcc00"],
+      [rBase * 0.25, "#ffff99"],
+    ];
+    for (const [rr, col] of rings) {
+      telemetryCtx.strokeStyle = col;
+      telemetryCtx.lineWidth = 1.5;
+      telemetryCtx.beginPath();
+      telemetryCtx.arc(cx, cy, rr, 0, Math.PI * 2);
+      telemetryCtx.stroke();
+    }
+    telemetryCtx.fillStyle = "#ffffff";
+    telemetryCtx.beginPath();
+    telemetryCtx.arc(cx, cy, 2, 0, Math.PI * 2);
+    telemetryCtx.fill();
+  }
+
+  // Per-shot static fit lines — skip the pending (unrevealed) one
+  shots.forEach((shot, i) => {
+    if (i === pendingShotIdx) return;
+    const color = shotColor(i);
+    const f = shotFit(shot);
+    if (!f) return;
+    telemetryCtx.strokeStyle = color;
+    telemetryCtx.lineWidth = 1.5;
+    telemetryCtx.lineCap = "round";
+    telemetryCtx.beginPath();
+    telemetryCtx.moveTo(mapX(f.startX), mapY(f.startY));
+    telemetryCtx.lineTo(mapX(f.hitX), mapY(f.hitY));
+    telemetryCtx.stroke();
+
+    telemetryCtx.fillStyle = color;
+    telemetryCtx.beginPath();
+    telemetryCtx.arc(mapX(f.hitX), mapY(f.hitY), 3.5, 0, Math.PI * 2);
+    telemetryCtx.fill();
+    telemetryCtx.font = "600 11px ui-monospace, monospace";
+    telemetryCtx.fillText(`#${shot.shot}`, mapX(f.hitX) + 6, mapY(f.hitY) - 6);
+  });
+
+  // Pending shot: trail grows with video time; no trail until Play pressed.
+  if (pendingShotIdx != null && currentTime != null) {
+    const shot = shots[pendingShotIdx];
+    const fit = shotFit(shot);
+    const traj = shot.trajectory;
+    if (fit && traj?.fps) {
+      const color = shotColor(pendingShotIdx);
+      const clipStart = traj.clip_start_frame ?? fit.f0;
+      const frame = clipStart + currentTime * traj.fps;
+      const f = Math.max(fit.f0, Math.min(fit.fHit, frame));
+      const ax = fit.fx.slope * f + fit.fx.intercept;
+      const ay = fit.fy.slope * f + fit.fy.intercept;
+      // Growing trail from start to current arrow position
+      telemetryCtx.strokeStyle = color;
+      telemetryCtx.lineWidth = 1.5;
+      telemetryCtx.lineCap = "round";
+      telemetryCtx.beginPath();
+      telemetryCtx.moveTo(mapX(fit.startX), mapY(fit.startY));
+      telemetryCtx.lineTo(mapX(ax), mapY(ay));
+      telemetryCtx.stroke();
+      // Moving arrow marker
+      if (frame >= fit.f0 && frame <= fit.fHit) {
+        telemetryCtx.fillStyle = "#ffffff";
+        telemetryCtx.strokeStyle = "#ffffff";
+        telemetryCtx.lineWidth = 2;
+        telemetryCtx.beginPath();
+        telemetryCtx.arc(mapX(ax), mapY(ay), 6, 0, Math.PI * 2);
+        telemetryCtx.stroke();
+        telemetryCtx.beginPath();
+        telemetryCtx.arc(mapX(ax), mapY(ay), 2, 0, Math.PI * 2);
+        telemetryCtx.fill();
+      }
+    }
+  }
+}
+
+// ==== Synced play ========================================================
+
+let playRaf = 0;
+function startSyncPlay() {
+  if (shots.length === 0) return;
+  // Re-arm the latest shot as pending so its trajectory hides and animates
+  // fresh on every Play press.
+  pendingShotIdx = shots.length - 1;
+  telemetryInfo.textContent = `${shots.length} shot${shots.length === 1 ? "" : "s"} (playing...)`;
+  try { lastShotClip.currentTime = 0; } catch {}
+  try { lastShotTracked.currentTime = 0; } catch {}
+  Promise.all([lastShotClip.play(), lastShotTracked.play()]).catch(() => {});
+  if (playRaf) cancelAnimationFrame(playRaf);
+  const loop = () => {
+    renderTelemetry(lastShotClip.currentTime);
+    if (!lastShotClip.paused && !lastShotClip.ended) {
+      playRaf = requestAnimationFrame(loop);
+    } else {
+      playRaf = 0;
+      renderTelemetry();
+    }
+  };
+  playRaf = requestAnimationFrame(loop);
+}
+function stopSyncPlay() {
+  lastShotClip.pause();
+  lastShotTracked.pause();
+  if (playRaf) { cancelAnimationFrame(playRaf); playRaf = 0; }
+  renderTelemetry();
+}
+playAllBtn.addEventListener("click", startSyncPlay);
+pauseAllBtn.addEventListener("click", stopSyncPlay);
+lastShotClip.addEventListener("ended", () => {
+  if (playRaf) { cancelAnimationFrame(playRaf); playRaf = 0; }
+  // Playback done — promote pending shot to the static view
+  pendingShotIdx = null;
+  telemetryInfo.textContent = `${shots.length} shot${shots.length === 1 ? "" : "s"}`;
+  renderTelemetry();
+});
+
+// ==== Boot ================================================================
+
 connectLiveWS();
+requestAnimationFrame(sizeCanvas);
