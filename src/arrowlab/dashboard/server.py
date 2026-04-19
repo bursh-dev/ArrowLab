@@ -237,11 +237,38 @@ class SessionAnnotation(BaseModel):
     target: Target
 
 
+@app.delete("/api/session/calibration")
+async def api_session_clear_calibration() -> dict:
+    s = _require_session()
+    # Wipe calibration frame + annotation from the session record
+    old_frame = s.get("calibration_frame")
+    s["calibration_frame"] = None
+    s["annotation"] = None
+    # Best-effort delete of the stored JPEG
+    if old_frame:
+        fname = old_frame.rsplit("/", 1)[-1]
+        (DATA_RAW / "sessions" / fname).unlink(missing_ok=True)
+    await _broadcast_view({"type": "state", **_session_snapshot()})
+    phone = LIVE_STATE["phone_ws"]
+    if phone is not None:
+        try:
+            await phone.send_json({"type": "annotation", "corridor": None, "target": None})
+        except Exception:
+            pass
+    return {"ok": True}
+
+
 @app.put("/api/session/annotation")
 async def api_session_annotation(annotation: SessionAnnotation) -> dict:
     s = _require_session()
     s["annotation"] = annotation.model_dump(exclude_none=True)
     await _broadcast_view({"type": "state", **_session_snapshot()})
+    phone = LIVE_STATE["phone_ws"]
+    if phone is not None:
+        try:
+            await phone.send_json({"type": "annotation", **s["annotation"]})
+        except Exception:
+            pass
     return {"ok": True}
 
 
@@ -275,6 +302,8 @@ async def ws_phone(ws: WebSocket) -> None:
     LIVE_STATE["phone_ws"] = ws
     s = LIVE_STATE["session"]
     await ws.send_json({"type": "paired", "session_id": s["id"]})
+    if s["annotation"] is not None:
+        await ws.send_json({"type": "annotation", **s["annotation"]})
     await _broadcast_view({"type": "state", **_session_snapshot()})
     try:
         while True:

@@ -367,7 +367,16 @@ function updateCalibAnnotationView() {
   saveCalibBtn.disabled = !(calib.annotation.corridor && calib.annotation.target);
 }
 
-clearCalibBtn.addEventListener("click", () => {
+clearCalibBtn.addEventListener("click", async () => {
+  // Wipe the captured frame + saved annotation on the server; the state
+  // broadcast will hide the calibration area and the phone overlay clears via
+  // the `annotation` message.
+  const res = await fetch("/api/session/calibration", { method: "DELETE" });
+  if (res.ok) {
+    logLive("calibration cleared", "ok");
+  } else {
+    logLive(`clear failed: ${await res.text()}`, "error");
+  }
   calib.annotation = { corridor: null, target: null };
   calib.pendingClicks = [];
   redrawCalib();
