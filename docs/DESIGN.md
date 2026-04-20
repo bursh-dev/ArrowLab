@@ -273,6 +273,24 @@ Near-term milestones in order of intended work:
   calibration JPEG so the operator can verify the annotation before doing a
   full set.
 
+### M9 — Dual-camera stereo for true 3D telemetry
+- Two phones (or phone + laptop camera) on opposite sides of the shooting
+  lane, both filming perpendicular to the arrow flight. Operator provides the
+  physical layout distances manually at calibration time.
+- Per-camera intrinsic calibration (checkerboard → `cv2.calibrateCamera`) and
+  extrinsic calibration (checkerboard on the ground or a few measured markers
+  seen by both cameras → `cv2.solvePnP`) yields each camera's position and
+  orientation in a shared world frame.
+- Per-frame sync across the two uploads: either a server-authoritative
+  timestamp stamped on each upload, or an audio/visual marker (bow release
+  click, LED flash) aligned in post.
+- With synced 2D tracks from both cameras, triangulate per-frame 3D position
+  of the arrow → absolute speed in m/s, true launch angle, gravitational drop
+  separated from horizontal drift, yaw oscillation amplitude/frequency, real
+  group size in cm, physics-based arrow-drag fit.
+- Opt-in "multi-cam" session mode on the server; existing single-camera path
+  still works for casual use.
+
 ### M8 — Laptop-connected camera as an alternative transport
 - Optional non-phone capture path: a GoPro in webcam mode (or similar USB/HDMI
   high-speed camera) feeds frames directly into the laptop.

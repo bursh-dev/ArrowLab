@@ -31,8 +31,19 @@ for (const b of tabButtons) b.addEventListener("click", () => activateTab(b.data
 
 const phoneStatus = document.getElementById("phoneStatus");
 const sessionStatus = document.getElementById("sessionStatus");
+const rangeStatus = document.getElementById("rangeStatus");
 const calibStatus = document.getElementById("calibStatus");
 const shotCountEl = document.getElementById("shotCount");
+
+const rangeSt = document.getElementById("rangeSt");
+const rangeCp = document.getElementById("rangeCp");
+const rangeCa = document.getElementById("rangeCa");
+const rangeMass = document.getElementById("rangeMass");
+const rangeBow = document.getElementById("rangeBow");
+const rangeNotes = document.getElementById("rangeNotes");
+const saveRangeBtn = document.getElementById("saveRangeBtn");
+const clearRangeBtn = document.getElementById("clearRangeBtn");
+const rangeDiagram = document.getElementById("rangeDiagram");
 const startSessionBtn = document.getElementById("startSessionBtn");
 const endSessionBtn = document.getElementById("endSessionBtn");
 const captureFrameBtn = document.getElementById("captureFrameBtn");
@@ -59,6 +70,18 @@ const lastShot = document.getElementById("lastShot");
 const lastShotClip = document.getElementById("lastShotClip");
 const lastShotTracked = document.getElementById("lastShotTracked");
 const lastShotNum = document.getElementById("lastShotNum");
+const statsShotNum = document.getElementById("statsShotNum");
+const statSpeed = document.getElementById("statSpeed");
+const statTime = document.getElementById("statTime");
+const statDist = document.getElementById("statDist");
+const statOffset = document.getElementById("statOffset");
+const statEnergy = document.getElementById("statEnergy");
+const groupCount = document.getElementById("groupCount");
+const statExtreme = document.getElementById("statExtreme");
+const statMeanR = document.getElementById("statMeanR");
+
+// Latest session range (populated from state). Null when no range is set.
+let currentRange = null;
 
 const telemetryCanvas = document.getElementById("telemetryCanvas");
 const telemetryCtx = telemetryCanvas.getContext("2d");
@@ -83,7 +106,7 @@ const shots = [];
 let pendingShotIdx = null;
 
 // Last seen state, used to decide tab auto-advance
-const lastState = { active: false, has_annotation: false };
+const lastState = { active: false, has_range: false, has_annotation: false };
 
 function logLive(line, kind = "info") {
   const div = document.createElement("div");
@@ -101,6 +124,9 @@ function applyState(st) {
 
   sessionStatus.textContent = st.active ? (st.session_id || "active") : "none";
   sessionStatus.className = "pill " + (st.active ? "ok" : "bad");
+
+  rangeStatus.textContent = st.has_range ? "yes" : "no";
+  rangeStatus.className = "pill " + (st.has_range ? "ok" : "bad");
 
   calibStatus.textContent = st.has_annotation ? "yes" : "no";
   calibStatus.className = "pill " + (st.has_annotation ? "ok" : "bad");
@@ -131,7 +157,7 @@ function applyState(st) {
   // but hidden once an annotation is saved (to de-clutter). Re-opening happens
   // by tapping Grab calibration frame again (which fires request_calibration_frame
   // and clears the stored annotation by capturing a fresh frame).
-  if (st.active && st.calibration_frame && !st.has_annotation) {
+  if (st.active && st.calibration_frame) {
     calibrationArea.classList.remove("hidden");
     if (currentCalibUrl !== st.calibration_frame) {
       currentCalibUrl = st.calibration_frame;
@@ -155,14 +181,43 @@ function applyState(st) {
     lastShotClip.removeAttribute("src"); lastShotClip.load();
     lastShotTracked.removeAttribute("src"); lastShotTracked.load();
     telemetryInfo.textContent = "";
+    updateStats();
     renderTelemetry();
   }
 
+  currentRange = st.range || null;
+
+  // Populate range form from server state (or keep user's in-progress input)
+  if (st.range) {
+    rangeSt.value = st.range.shooter_to_target_m ?? "";
+    rangeCp.value = st.range.camera_perpendicular_m ?? "";
+    rangeCa.value = st.range.camera_along_m ?? "";
+    rangeMass.value = st.range.arrow_mass_grains ?? "";
+    rangeBow.value = st.range.bow_weight_lbs ?? "";
+    rangeNotes.value = st.range.notes ?? "";
+  } else if (!lastState.active && st.active) {
+    // Fresh session: try to pre-fill from localStorage (last used range)
+    try {
+      const saved = JSON.parse(localStorage.getItem("arrowlab.range") || "null");
+      if (saved) {
+        rangeSt.value = saved.shooter_to_target_m ?? "";
+        rangeCp.value = saved.camera_perpendicular_m ?? "";
+        rangeCa.value = saved.camera_along_m ?? "";
+        rangeMass.value = saved.arrow_mass_grains ?? "";
+        rangeBow.value = saved.bow_weight_lbs ?? "";
+        rangeNotes.value = saved.notes ?? "";
+      }
+    } catch {}
+  }
+  renderRangeDiagram();
+
   // Auto-advance tabs on state transitions
-  if (!lastState.active && st.active) activateTab("calibrate");
+  if (!lastState.active && st.active) activateTab(st.has_range ? "calibrate" : "range");
   else if (lastState.active && !st.active) activateTab("session");
+  else if (!lastState.has_range && st.has_range) activateTab("calibrate");
   else if (!lastState.has_annotation && st.has_annotation) activateTab("shoot");
   lastState.active = st.active;
+  lastState.has_range = !!st.has_range;
   lastState.has_annotation = !!st.has_annotation;
 
   updateCalibAnnotationView();
@@ -190,6 +245,15 @@ function handleLiveMsg(msg) {
     applyState(msg);
   } else if (msg.type === "calibration_frame_ready") {
     logLive("calibration frame received", "ok");
+    // Force reload — filename is stable per session so the src URL alone
+    // wouldn't change and the browser would keep the cached image.
+    calib.imgLoaded = false;
+    calib.pendingClicks = [];
+    calib.annotation = { corridor: null, target: null };
+    currentCalibUrl = msg.url;
+    calibrationArea.classList.remove("hidden");
+    calibImage.src = msg.url + (msg.url.includes("?") ? "&" : "?") + "t=" + Date.now();
+    updateCalibAnnotationView();
   } else if (msg.type === "shot_uploaded") {
     logLive(`shot ${msg.shot}: ${(msg.bytes / 1024 / 1024).toFixed(1)} MB uploaded, processing...`);
   } else if (msg.type === "shot_ready") {
@@ -203,6 +267,7 @@ function handleLiveMsg(msg) {
     shots.push(msg);
     pendingShotIdx = shots.length - 1;
     telemetryInfo.textContent = `${shots.length} shot${shots.length === 1 ? "" : "s"} (press Play to reveal)`;
+    updateStats();
     sizeCanvas();
   } else if (msg.type === "shot_failed") {
     logLive(`shot ${msg.shot}: FAILED (${msg.reason || "unknown"})`, "error");
@@ -624,7 +689,228 @@ lastShotClip.addEventListener("ended", () => {
   renderTelemetry();
 });
 
+// ==== Shot stats =========================================================
+
+function fmt(n, digits = 1, suffix = "") {
+  if (n == null || !isFinite(n)) return "—";
+  return n.toFixed(digits) + suffix;
+}
+
+function computeShotStats(shot) {
+  const traj = shot.trajectory;
+  const t = traj?.annotation?.target;
+  const dets = traj?.detections || [];
+  if (!t || !t.r || !t.face_diameter_m || dets.length < 2) return null;
+  const fps = traj.fps || 30;
+  const mPerPx = t.face_diameter_m / (2 * t.r);
+  const first = dets[0];
+  const last = dets[dets.length - 1];
+  const pxDx = Math.hypot(last.x - first.x, last.y - first.y);
+  const distanceM = pxDx * mPerPx;
+  const durSec = (last.frame - first.frame) / fps;
+  const speedMs = durSec > 0 ? distanceM / durSec : null;
+  const fit = shotFit(shot);
+  let hitOffsetCm = null;
+  if (fit) {
+    const dxPx = fit.hitX - t.cx;
+    const dyPx = fit.hitY - t.cy;
+    hitOffsetCm = Math.hypot(dxPx, dyPx) * mPerPx * 100;
+  }
+  let keJ = null, keFtLbs = null;
+  const mass = currentRange?.arrow_mass_grains;
+  if (speedMs != null && mass) {
+    const massKg = mass * 0.0000647989;
+    keJ = 0.5 * massKg * speedMs * speedMs;
+    keFtLbs = keJ / 1.3558;
+  }
+  return { speedMs, durSec, distanceM, hitOffsetCm, keJ, keFtLbs };
+}
+
+function computeGroup(shots) {
+  const pts = [];
+  for (const shot of shots) {
+    const t = shot.trajectory?.annotation?.target;
+    const fit = shotFit(shot);
+    if (!t || !t.r || !t.face_diameter_m || !fit) continue;
+    const mPerPx = t.face_diameter_m / (2 * t.r);
+    pts.push({
+      x: (fit.hitX - t.cx) * mPerPx * 100,
+      y: (fit.hitY - t.cy) * mPerPx * 100,
+    });
+  }
+  if (pts.length < 2) return { count: pts.length, extremeCm: null, meanRCm: null };
+  let maxD = 0;
+  for (let i = 0; i < pts.length; i++) {
+    for (let j = i + 1; j < pts.length; j++) {
+      const d = Math.hypot(pts[i].x - pts[j].x, pts[i].y - pts[j].y);
+      if (d > maxD) maxD = d;
+    }
+  }
+  const cx = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+  const cy = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+  const meanR = pts.reduce((s, p) => s + Math.hypot(p.x - cx, p.y - cy), 0) / pts.length;
+  return { count: pts.length, extremeCm: maxD, meanRCm: meanR };
+}
+
+function updateStats() {
+  const shot = shots[shots.length - 1];
+  if (!shot) {
+    statsShotNum.textContent = "?";
+    statSpeed.textContent = statTime.textContent = statDist.textContent =
+      statOffset.textContent = statEnergy.textContent = "—";
+    groupCount.textContent = "0";
+    statExtreme.textContent = statMeanR.textContent = "—";
+    return;
+  }
+  statsShotNum.textContent = shot.shot;
+  const s = computeShotStats(shot);
+  if (s) {
+    statSpeed.textContent = fmt(s.speedMs, 1, " m/s");
+    statTime.textContent = fmt(s.durSec * 1000, 0, " ms");
+    statDist.textContent = fmt(s.distanceM, 2, " m");
+    statOffset.textContent = fmt(s.hitOffsetCm, 1, " cm");
+    statEnergy.textContent = s.keJ != null
+      ? `${s.keJ.toFixed(1)} J / ${s.keFtLbs.toFixed(1)} ft·lbs`
+      : "— (need arrow mass)";
+  }
+  const g = computeGroup(shots);
+  groupCount.textContent = g.count;
+  statExtreme.textContent = g.extremeCm != null ? fmt(g.extremeCm, 1, " cm") : "—";
+  statMeanR.textContent = g.meanRCm != null ? fmt(g.meanRCm, 1, " cm") : "—";
+}
+
+// ==== Range (shooting-range geometry) =====================================
+
+function renderRangeDiagram() {
+  const svg = rangeDiagram;
+  const vbW = 800, vbH = 360;
+  const pad = 50;
+  const stT = parseFloat(rangeSt.value);
+  const cp = parseFloat(rangeCp.value);
+  const ca = parseFloat(rangeCa.value);
+  if (!isFinite(stT) || stT <= 0) {
+    svg.innerHTML =
+      `<text x="${vbW / 2}" y="${vbH / 2}" fill="#666" text-anchor="middle" font-size="14">` +
+      `enter shooter↔target distance to see layout</text>`;
+    return;
+  }
+  // World frame: shooter at (0, 0), target at (stT, 0), camera at (ca, -cp)
+  const camY = isFinite(cp) && cp > 0 ? -cp : 0;
+  const camX = isFinite(ca) ? ca : stT / 2;
+  const wxMin = Math.min(-0.5, camX - 0.5);
+  const wxMax = Math.max(stT + 0.5, camX + 0.5);
+  const wyMin = Math.min(camY - 0.5, -1);
+  const wyMax = 1.2;
+  const scaleX = (vbW - 2 * pad) / (wxMax - wxMin);
+  const scaleY = (vbH - 2 * pad) / (wyMax - wyMin);
+  const s = Math.min(scaleX, scaleY);
+  const mapX = (x) => pad + (x - wxMin) * s;
+  const mapY = (y) => vbH - pad - (y - wyMin) * s;
+  const parts = [];
+  parts.push(
+    `<line x1="${mapX(0)}" y1="${mapY(0)}" x2="${mapX(stT)}" y2="${mapY(0)}" ` +
+    `stroke="#666" stroke-width="2" stroke-dasharray="6,4" />`
+  );
+  // shooter
+  parts.push(
+    `<circle cx="${mapX(0)}" cy="${mapY(0)}" r="9" fill="#4080ff" />` +
+    `<text x="${mapX(0)}" y="${mapY(0) + 24}" fill="#ddd" font-size="12" text-anchor="middle">shooter</text>`
+  );
+  // target
+  parts.push(
+    `<rect x="${mapX(stT) - 14}" y="${mapY(0) - 14}" width="28" height="28" ` +
+    `fill="none" stroke="#ff6060" stroke-width="2" />` +
+    `<text x="${mapX(stT)}" y="${mapY(0) + 28}" fill="#ddd" font-size="12" text-anchor="middle">target</text>`
+  );
+  // shooter-target distance label
+  parts.push(
+    `<text x="${(mapX(0) + mapX(stT)) / 2}" y="${mapY(0) - 10}" ` +
+    `fill="#ccc" font-size="11" text-anchor="middle">${stT.toFixed(2)} m</text>`
+  );
+  // camera + perpendicular
+  if (isFinite(cp) && cp > 0 && isFinite(ca)) {
+    const cX = mapX(ca);
+    const cY = mapY(-cp);
+    const footX = mapX(ca);
+    const footY = mapY(0);
+    parts.push(
+      `<line x1="${cX}" y1="${cY}" x2="${footX}" y2="${footY}" ` +
+      `stroke="#80ff80" stroke-width="1" stroke-dasharray="4,4" />`
+    );
+    parts.push(
+      `<circle cx="${cX}" cy="${cY}" r="8" fill="#80ff80" />` +
+      `<text x="${cX}" y="${cY - 12}" fill="#ddd" font-size="12" text-anchor="middle">camera</text>`
+    );
+    parts.push(
+      `<text x="${cX + 10}" y="${(cY + footY) / 2}" fill="#9f9" font-size="11">${cp.toFixed(2)} m</text>`
+    );
+    // along-line label (shooter → camera foot)
+    if (Math.abs(ca) > 0.1) {
+      parts.push(
+        `<text x="${(mapX(0) + footX) / 2}" y="${mapY(0) + 42}" ` +
+        `fill="#88f" font-size="10" text-anchor="middle">${ca.toFixed(2)} m</text>`
+      );
+      parts.push(
+        `<line x1="${mapX(0)}" y1="${mapY(0) + 30}" x2="${footX}" y2="${mapY(0) + 30}" ` +
+        `stroke="#88f" stroke-width="1" />`
+      );
+    }
+  }
+  svg.innerHTML = parts.join("");
+}
+
+for (const inp of [rangeSt, rangeCp, rangeCa]) {
+  inp.addEventListener("input", renderRangeDiagram);
+}
+
+saveRangeBtn.addEventListener("click", async () => {
+  const stT = parseFloat(rangeSt.value);
+  const cp = parseFloat(rangeCp.value);
+  const ca = parseFloat(rangeCa.value);
+  if (!(isFinite(stT) && stT > 0)) {
+    logLive("Shooter↔Target distance is required", "error");
+    return;
+  }
+  if (!(isFinite(cp) && cp > 0)) {
+    logLive("Camera perpendicular distance is required", "error");
+    return;
+  }
+  if (!isFinite(ca)) {
+    logLive("Camera along-line distance is required", "error");
+    return;
+  }
+  const body = {
+    shooter_to_target_m: stT,
+    camera_perpendicular_m: cp,
+    camera_along_m: ca,
+  };
+  const mass = parseFloat(rangeMass.value);
+  if (isFinite(mass) && mass > 0) body.arrow_mass_grains = mass;
+  const bow = parseFloat(rangeBow.value);
+  if (isFinite(bow) && bow > 0) body.bow_weight_lbs = bow;
+  const notes = rangeNotes.value.trim();
+  if (notes) body.notes = notes;
+  const res = await fetch("/api/session/range", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (res.ok) {
+    logLive("range saved", "ok");
+    try { localStorage.setItem("arrowlab.range", JSON.stringify(body)); } catch {}
+  } else {
+    logLive(`range save failed: ${await res.text()}`, "error");
+  }
+});
+
+clearRangeBtn.addEventListener("click", async () => {
+  const res = await fetch("/api/session/range", { method: "DELETE" });
+  if (res.ok) logLive("range cleared", "ok");
+  else logLive(`range clear failed: ${await res.text()}`, "error");
+});
+
 // ==== Boot ================================================================
 
 connectLiveWS();
 requestAnimationFrame(sizeCanvas);
+renderRangeDiagram();

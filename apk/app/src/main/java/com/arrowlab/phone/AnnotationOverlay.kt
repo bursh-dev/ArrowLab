@@ -63,26 +63,16 @@ class AnnotationOverlay @JvmOverloads constructor(
     override fun onDraw(canvas: Canvas) {
         val a = annotation ?: return
         if (a.imageW <= 0 || a.imageH <= 0) return
-        val sx = width.toFloat() / a.imageW
+        // Only the corridor lines are drawn on the live preview — target /
+        // bbox overlays would need the same non-uniform display transform the
+        // TextureView applies, which is fiddly; the operator verifies those
+        // against the calibration JPEG in the browser instead.
         val sy = height.toFloat() / a.imageH
-        val savg = (sx + sy) / 2f
-
         if (a.corridorTop != null && a.corridorBottom != null) {
             val yt = a.corridorTop * sy
             val yb = a.corridorBottom * sy
             canvas.drawLine(0f, yt, width.toFloat(), yt, corridorPaint)
             canvas.drawLine(0f, yb, width.toFloat(), yb, corridorPaint)
-        }
-        if (a.targetCx != null && a.targetCy != null) {
-            val cx = a.targetCx * sx
-            val cy = a.targetCy * sy
-            if (a.targetR > 0) {
-                canvas.drawCircle(cx, cy, a.targetR * savg, targetRingPaint)
-            }
-            canvas.drawCircle(cx, cy, 6f, targetDotPaint)
-        }
-        a.bbox?.let { b ->
-            canvas.drawRect(b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy, bboxPaint)
         }
     }
 }

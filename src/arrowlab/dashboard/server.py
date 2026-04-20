@@ -171,6 +171,7 @@ def _new_session() -> dict:
         "id": stem,
         "stem": stem,
         "created_at": datetime.now().isoformat(timespec="seconds"),
+        "range": None,               # physical geometry (distances) once set
         "calibration_frame": None,  # relative URL once JPEG uploaded
         "annotation": None,          # {corridor, target} once saved
         "shot_count": 0,
@@ -198,6 +199,8 @@ def _session_snapshot() -> dict:
         "phone_connected": LIVE_STATE["phone_ws"] is not None,
         "active": s is not None,
         "session_id": s["id"] if s else None,
+        "range": s["range"] if s else None,
+        "has_range": bool(s and s["range"]),
         "calibration_frame": s["calibration_frame"] if s else None,
         "has_annotation": bool(s and s["annotation"]),
         "shot_count": s["shot_count"] if s else 0,
@@ -238,6 +241,31 @@ class SessionAnnotation(BaseModel):
     target: Target
 
 
+class SessionRange(BaseModel):
+    shooter_to_target_m: float
+    camera_perpendicular_m: float  # perpendicular distance from camera to the shooting line
+    camera_along_m: float          # camera's foot-of-perpendicular on the line, measured from shooter (0 = at shooter, D = at target)
+    arrow_mass_grains: float | None = None
+    bow_weight_lbs: float | None = None
+    notes: str | None = None
+
+
+@app.put("/api/session/range")
+async def api_session_range(r: SessionRange) -> dict:
+    s = _require_session()
+    s["range"] = r.model_dump(exclude_none=True)
+    await _broadcast_view({"type": "state", **_session_snapshot()})
+    return {"ok": True}
+
+
+@app.delete("/api/session/range")
+async def api_session_clear_range() -> dict:
+    s = _require_session()
+    s["range"] = None
+    await _broadcast_view({"type": "state", **_session_snapshot()})
+    return {"ok": True}
+
+
 @app.delete("/api/session/calibration")
 async def api_session_clear_calibration() -> dict:
     s = _require_session()
@@ -273,6 +301,25 @@ async def api_session_annotation(annotation: SessionAnnotation) -> dict:
     return {"ok": True}
 
 
+def _extract_middle_jpeg(mp4: Path, out_jpeg: Path) -> None:
+    """Pull a single near-end frame out of an mp4 as JPEG."""
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-sseof", "-0.2",
+            "-i", str(mp4),
+            "-frames:v", "1",
+            "-q:v", "3",
+            str(out_jpeg),
+        ],
+        check=True,
+    )
+
+
+def _looks_like_mp4(data: bytes) -> bool:
+    return len(data) >= 12 and data[4:8] == b"ftyp"
+
+
 @app.post("/api/calibration-frame")
 async def api_calibration_frame(request: Request) -> dict:
     s = _require_session()
@@ -281,7 +328,20 @@ async def api_calibration_frame(request: Request) -> dict:
         raise HTTPException(400, "empty body")
     out = DATA_RAW / "sessions" / f"{s['stem']}_calibration.jpg"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_bytes(data)
+    content_type = request.headers.get("content-type", "").lower()
+    if "video/mp4" in content_type or _looks_like_mp4(data):
+        # Real-phone path: short mp4 from the ring buffer. Extract one frame
+        # server-side; orientation follows whatever the mp4 has baked in,
+        # which matches the shot mp4 frames the tracker later consumes.
+        mp4_path = DATA_RAW / "sessions" / f"{s['stem']}_calibration.mp4"
+        mp4_path.write_bytes(data)
+        try:
+            await run_in_threadpool(_extract_middle_jpeg, mp4_path, out)
+        finally:
+            mp4_path.unlink(missing_ok=True)
+    else:
+        # Fake-phone path: direct JPEG upload.
+        out.write_bytes(data)
     url = "/videos/" + out.relative_to(DATA_RAW).as_posix()
     s["calibration_frame"] = url
     await _broadcast_view({"type": "calibration_frame_ready", "url": url})
@@ -305,6 +365,9 @@ async def ws_phone(ws: WebSocket) -> None:
     await ws.send_json({"type": "paired", "session_id": s["id"]})
     if s["annotation"] is not None:
         await ws.send_json({"type": "annotation", **s["annotation"]})
+    else:
+        # Explicit clear so a reconnecting phone doesn't keep stale overlays.
+        await ws.send_json({"type": "annotation", "corridor": None, "target": None})
     await _broadcast_view({"type": "state", **_session_snapshot()})
     try:
         while True:

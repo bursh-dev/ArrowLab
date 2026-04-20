@@ -20,12 +20,14 @@
     <div class="status-bar">
       <span>Phone: <span id="phoneStatus" class="pill bad">none</span></span>
       <span>Session: <span id="sessionStatus" class="pill bad">none</span></span>
+      <span>Range: <span id="rangeStatus" class="pill bad">no</span></span>
       <span>Calibrated: <span id="calibStatus" class="pill bad">no</span></span>
       <span id="shotCount" class="shot-count">0 shots</span>
     </div>
 
     <nav class="tabs" id="tabs">
       <button data-tab="session" class="active">Session</button>
+      <button data-tab="range">Range</button>
       <button data-tab="calibrate">Calibrate</button>
       <button data-tab="shoot">Shoot</button>
     </nav>
@@ -36,6 +38,37 @@
         <button id="startSessionBtn">Start session</button>
         <button id="endSessionBtn" disabled>End session</button>
       </div>
+    </section>
+
+    <!-- RANGE TAB -->
+    <section class="tab-panel" data-tab="range">
+      <div class="range-form">
+        <div class="range-inputs">
+          <label>Shooter ↔ Target (m)
+            <input id="rangeSt" type="number" step="0.01" min="0" placeholder="18.00" />
+          </label>
+          <label>Camera perpendicular (m)
+            <input id="rangeCp" type="number" step="0.01" min="0" placeholder="2.50" />
+          </label>
+          <label>Camera along line (m, from shooter)
+            <input id="rangeCa" type="number" step="0.01" placeholder="9.00" />
+          </label>
+          <label>Arrow mass (grains, optional)
+            <input id="rangeMass" type="number" step="1" min="0" placeholder="350" />
+          </label>
+          <label>Bow draw weight (lbs, optional)
+            <input id="rangeBow" type="number" step="1" min="0" placeholder="45" />
+          </label>
+          <label class="range-notes">Notes (optional)
+            <input id="rangeNotes" type="text" placeholder="club lane 3, wood backstop" />
+          </label>
+        </div>
+        <div class="range-actions">
+          <button id="saveRangeBtn">Save range</button>
+          <button id="clearRangeBtn">Clear</button>
+        </div>
+      </div>
+      <svg id="rangeDiagram" class="range-diagram" viewBox="0 0 800 360" xmlns="http://www.w3.org/2000/svg"></svg>
     </section>
 
     <!-- CALIBRATE TAB -->
@@ -93,6 +126,25 @@
             <video id="lastShotTracked" controls muted preload="metadata"></video>
             <figcaption>tracked</figcaption>
           </figure>
+          <div class="shot-stats">
+            <div class="stats-block">
+              <h4>Shot #<span id="statsShotNum">?</span></h4>
+              <dl>
+                <dt>Speed</dt><dd id="statSpeed">—</dd>
+                <dt>Flight time</dt><dd id="statTime">—</dd>
+                <dt>Distance</dt><dd id="statDist">—</dd>
+                <dt>Hit offset</dt><dd id="statOffset">—</dd>
+                <dt>Energy</dt><dd id="statEnergy">—</dd>
+              </dl>
+            </div>
+            <div class="stats-block">
+              <h4>Group (<span id="groupCount">0</span>)</h4>
+              <dl>
+                <dt>Extreme spread</dt><dd id="statExtreme">—</dd>
+                <dt>Mean radius</dt><dd id="statMeanR">—</dd>
+              </dl>
+            </div>
+          </div>
         </div>
       </div>
 

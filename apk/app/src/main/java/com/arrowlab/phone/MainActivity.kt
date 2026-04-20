@@ -313,13 +313,13 @@ class MainActivity : AppCompatActivity() {
                 userRequestedDisconnect = true
             }
             "capture_frame" -> {
-                appendLog("capture_frame received, grabbing still...")
-                cameraController?.captureStillJpeg { bytes ->
+                appendLog("capture_frame received, slicing 1s for calibration...")
+                cameraController?.sliceLastSeconds(1.0) { bytes ->
                     runOnUiThread {
                         if (bytes == null) {
-                            appendLog("still capture failed", error = true)
+                            appendLog("calibration slice failed", error = true)
                         } else {
-                            appendLog("captured ${bytes.size} bytes, uploading...")
+                            appendLog("sliced ${bytes.size / 1024} KB, uploading...")
                             uploadCalibrationFrame(bytes)
                         }
                     }
@@ -372,7 +372,7 @@ class MainActivity : AppCompatActivity() {
         val host = currentHost ?: return
         scope.launch(Dispatchers.IO) {
             try {
-                val body = bytes.toRequestBody("image/jpeg".toMediaType())
+                val body = bytes.toRequestBody("video/mp4".toMediaType())
                 val req = Request.Builder()
                     .url("http://$host:$SERVER_PORT/api/calibration-frame")
                     .post(body)
