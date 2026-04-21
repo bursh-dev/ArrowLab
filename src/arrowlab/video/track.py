@@ -361,7 +361,11 @@ def track_clip(
     TRACKED_DIR.mkdir(parents=True, exist_ok=True)
     tracked_path = TRACKED_DIR / f"{output_stem}_tracked.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(tracked_path), fourcc, fps, (w, h))
+    # Round fps: source mp4s from the phone's MediaCodec encoder embed a
+    # fine-grained timebase (e.g. 1/89409) that MPEG-4 Part 2 (mp4v)
+    # rejects with "maximum admitted denominator is 65535".
+    writer_fps = max(1, int(round(fps)))
+    writer = cv2.VideoWriter(str(tracked_path), fourcc, float(writer_fps), (w, h))
     kept_by_frame = {d["frame"]: d for d in cleaned}
     trail: list[tuple[int, int]] = []
 

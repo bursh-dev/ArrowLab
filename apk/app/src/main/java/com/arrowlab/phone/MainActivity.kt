@@ -1,6 +1,7 @@
 package com.arrowlab.phone
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.text.format.DateFormat
@@ -166,6 +167,7 @@ class MainActivity : AppCompatActivity() {
             }
             appendLog("discovery: found server at $host:$SERVER_PORT", ok = true)
             currentHost = host
+            if (host != "127.0.0.1") rememberHost(host)
             connect(host, SERVER_PORT)
         }
     }
@@ -176,17 +178,31 @@ class MainActivity : AppCompatActivity() {
             appendLog("discovery: USB reverse-tether hit (127.0.0.1)")
             return "127.0.0.1"
         }
-        val subnet = getLocalSubnetPrefix()
-        if (subnet == null) {
+        // Try last-known-good IP (saved on prior successful connect).
+        val lastHost = getSharedPreferences("arrowlab", Context.MODE_PRIVATE)
+            .getString("last_host", "172.20.214.141")
+        if (!lastHost.isNullOrBlank()) {
+            if (withContext(Dispatchers.IO) { probe(lastHost, port) }) {
+                appendLog("discovery: last-known-good $lastHost hit")
+                return lastHost
+            }
+        }
+        val prefixes = getLocalSubnetPrefixes()
+        if (prefixes.isEmpty()) {
             appendLog("discovery: no Wi-Fi and no USB tether", error = true)
             return null
         }
-        appendLog("discovery: scanning $subnet.1-254 on port $port...")
+        appendLog("discovery: scanning ${prefixes.joinToString { "$it.0/24" }} on port $port...")
         return withContext(Dispatchers.IO) {
-            val ips = (1..254).map { "$subnet.$it" }
+            val ips = prefixes.flatMap { p -> (1..254).map { "$p.$it" } }
             val deferreds = ips.map { ip -> async { if (probe(ip, port)) ip else null } }
             deferreds.awaitAll().firstOrNull { it != null }
         }
+    }
+
+    private fun rememberHost(host: String) {
+        getSharedPreferences("arrowlab", Context.MODE_PRIVATE)
+            .edit().putString("last_host", host).apply()
     }
 
     private fun probe(ip: String, port: Int): Boolean {
@@ -205,8 +221,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun getLocalSubnetPrefix(): String? {
-        val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
+    private fun getLocalSubnetPrefixes(): List<String> {
+        val prefixes = mutableListOf<String>()
+        val interfaces = NetworkInterface.getNetworkInterfaces() ?: return prefixes
         for (ni in interfaces) {
             if (!ni.isUp || ni.isLoopback) continue
             for (addr in ni.inetAddresses) {
@@ -215,11 +232,12 @@ class MainActivity : AppCompatActivity() {
                     !addr.isLinkLocalAddress
                 ) {
                     val ip = addr.hostAddress ?: continue
-                    return ip.substringBeforeLast('.')
+                    val prefix = ip.substringBeforeLast('.')
+                    if (prefix !in prefixes) prefixes.add(prefix)
                 }
             }
         }
-        return null
+        return prefixes
     }
 
     private fun connect(host: String, port: Int) {

@@ -164,6 +164,8 @@ LIVE_STATE: dict = {
     "session": None,  # dict when active, None otherwise
 }
 
+SESSION_STATE_FILE = DATA_RAW / "sessions" / "_active.json"
+
 
 def _new_session() -> dict:
     stem = "sess_" + datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -179,6 +181,85 @@ def _new_session() -> dict:
         "shots": [],                 # list of shot_ready payload dicts (for view replay)
         "fake_source": None,         # filename hint advertised by fake phone for the scrubber
     }
+
+
+def _persist_session() -> None:
+    s = LIVE_STATE["session"]
+    if s is None:
+        SESSION_STATE_FILE.unlink(missing_ok=True)
+        return
+    SESSION_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data = {k: s[k] for k in ("id", "stem", "created_at", "range", "calibration_frame", "annotation", "shot_count", "fake_source", "shots")}
+    SESSION_STATE_FILE.write_text(json.dumps(data, indent=2))
+
+
+def _load_persisted_session() -> None:
+    if not SESSION_STATE_FILE.exists():
+        return
+    try:
+        data = json.loads(SESSION_STATE_FILE.read_text())
+    except Exception:
+        return
+    s = _new_session()
+    for k in ("id", "stem", "created_at", "range", "calibration_frame", "annotation", "shot_count", "fake_source", "shots"):
+        if k in data:
+            s[k] = data[k]
+    # Recover shots from on-disk trajectories if persisted list is empty
+    if not s["shots"]:
+        s["shots"] = _recover_shots_for_stem(s["stem"])
+    LIVE_STATE["session"] = s
+
+
+def _recover_shots_for_stem(stem: str) -> list[dict]:
+    traj_dir = DATA_PROCESSED / "trajectories"
+    if not traj_dir.exists():
+        return []
+    recovered: list[dict] = []
+    for yaml_path in sorted(traj_dir.glob(f"{stem}_shot*.yaml")):
+        # Expect filename like {stem}_shot01.yaml
+        shot_str = yaml_path.stem.replace(f"{stem}_shot", "")
+        try:
+            n = int(shot_str)
+        except ValueError:
+            continue
+        clip_mp4 = DATA_RAW / "sessions" / f"{stem}_shot{n:02d}.mp4"
+        tracked_mp4 = DATA_PROCESSED / "tracked" / f"{stem}_shot{n:02d}_tracked.mp4"
+        if not clip_mp4.exists() or not tracked_mp4.exists():
+            continue
+        try:
+            trajectory = yaml.safe_load(yaml_path.read_text())
+        except Exception:
+            continue
+        fps = float(trajectory.get("fps") or 240.0)
+        fw = trajectory.get("flight_window") or [1, 1]
+        start_s = max(0.0, (fw[0] - 1) / fps - 0.2)
+        # Prefer trimmed versions if they exist
+        clip_trim = clip_mp4.with_name(clip_mp4.stem + "_trim.mp4")
+        tracked_trim = tracked_mp4.with_name(tracked_mp4.stem + "_trim.mp4")
+        trim_offset_s = 0.0
+        if clip_trim.exists() and tracked_trim.exists():
+            out_clip = clip_trim
+            out_tracked = tracked_trim
+            trim_offset_s = start_s
+            start_s = 0.0
+        else:
+            out_clip = clip_mp4
+            out_tracked = tracked_mp4
+        recovered.append({
+            "type": "shot_ready",
+            "shot": n,
+            "clip_url": "/videos/" + out_clip.relative_to(DATA_RAW).as_posix(),
+            "tracked_url": "/processed/" + out_tracked.relative_to(DATA_PROCESSED).as_posix(),
+            "trajectory": trajectory,
+            "start_s": start_s,
+            "trim_offset_s": trim_offset_s,
+        })
+    return recovered
+
+
+@app.on_event("startup")
+def _on_startup() -> None:
+    _load_persisted_session()
 
 
 async def _broadcast_view(msg: dict) -> None:
@@ -205,6 +286,7 @@ def _session_snapshot() -> dict:
         "has_annotation": bool(s and s["annotation"]),
         "shot_count": s["shot_count"] if s else 0,
         "fake_source": s["fake_source"] if s else None,
+        "shots": s["shots"] if s else [],
     }
 
 
@@ -220,6 +302,7 @@ async def api_session_start() -> dict:
     if LIVE_STATE["session"] is not None:
         raise HTTPException(409, "session already active")
     LIVE_STATE["session"] = _new_session()
+    _persist_session()
     await _broadcast_view({"type": "state", **_session_snapshot()})
     return {"ok": True, **_session_snapshot()}
 
@@ -227,6 +310,7 @@ async def api_session_start() -> dict:
 @app.post("/api/session/end")
 async def api_session_end() -> dict:
     LIVE_STATE["session"] = None
+    _persist_session()
     await _broadcast_view({"type": "state", **_session_snapshot()})
     return {"ok": True}
 
@@ -234,6 +318,20 @@ async def api_session_end() -> dict:
 @app.get("/api/session")
 def api_session() -> dict:
     return _session_snapshot()
+
+
+@app.get("/api/session/debug")
+def api_session_debug() -> dict:
+    s = LIVE_STATE["session"]
+    if s is None:
+        return {"session": None}
+    return {
+        "session_id": s["id"],
+        "stem": s["stem"],
+        "annotation": s["annotation"],
+        "range": s["range"],
+        "shot_count": s["shot_count"],
+    }
 
 
 class SessionAnnotation(BaseModel):
@@ -254,6 +352,7 @@ class SessionRange(BaseModel):
 async def api_session_range(r: SessionRange) -> dict:
     s = _require_session()
     s["range"] = r.model_dump(exclude_none=True)
+    _persist_session()
     await _broadcast_view({"type": "state", **_session_snapshot()})
     return {"ok": True}
 
@@ -262,6 +361,7 @@ async def api_session_range(r: SessionRange) -> dict:
 async def api_session_clear_range() -> dict:
     s = _require_session()
     s["range"] = None
+    _persist_session()
     await _broadcast_view({"type": "state", **_session_snapshot()})
     return {"ok": True}
 
@@ -277,6 +377,7 @@ async def api_session_clear_calibration() -> dict:
     if old_frame:
         fname = old_frame.rsplit("/", 1)[-1]
         (DATA_RAW / "sessions" / fname).unlink(missing_ok=True)
+    _persist_session()
     await _broadcast_view({"type": "state", **_session_snapshot()})
     phone = LIVE_STATE["phone_ws"]
     if phone is not None:
@@ -287,10 +388,30 @@ async def api_session_clear_calibration() -> dict:
     return {"ok": True}
 
 
+@app.delete("/api/session/shot/{n}")
+async def api_session_delete_shot(n: int) -> dict:
+    s = _require_session()
+    shots = s.get("shots") or []
+    keep = [sh for sh in shots if int(sh.get("shot", -1)) != n]
+    removed = len(shots) - len(keep)
+    s["shots"] = keep
+    stem = s["stem"]
+    # Best-effort file cleanup (raw, trimmed raw, tracked, trimmed tracked, trajectory)
+    (DATA_RAW / "sessions" / f"{stem}_shot{n:02d}.mp4").unlink(missing_ok=True)
+    (DATA_RAW / "sessions" / f"{stem}_shot{n:02d}_trim.mp4").unlink(missing_ok=True)
+    (DATA_PROCESSED / "tracked" / f"{stem}_shot{n:02d}_tracked.mp4").unlink(missing_ok=True)
+    (DATA_PROCESSED / "tracked" / f"{stem}_shot{n:02d}_tracked_trim.mp4").unlink(missing_ok=True)
+    (DATA_PROCESSED / "trajectories" / f"{stem}_shot{n:02d}.yaml").unlink(missing_ok=True)
+    _persist_session()
+    await _broadcast_view({"type": "state", **_session_snapshot()})
+    return {"ok": True, "removed": removed}
+
+
 @app.put("/api/session/annotation")
 async def api_session_annotation(annotation: SessionAnnotation) -> dict:
     s = _require_session()
     s["annotation"] = annotation.model_dump(exclude_none=True)
+    _persist_session()
     await _broadcast_view({"type": "state", **_session_snapshot()})
     phone = LIVE_STATE["phone_ws"]
     if phone is not None:
@@ -311,6 +432,23 @@ def _extract_middle_jpeg(mp4: Path, out_jpeg: Path) -> None:
             "-frames:v", "1",
             "-q:v", "3",
             str(out_jpeg),
+        ],
+        check=True,
+    )
+
+
+def _ffmpeg_trim(src: Path, dst: Path, start_s: float) -> None:
+    """Re-encode `src` into `dst`, dropping everything before start_s (frame-accurate)."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-ss", f"{max(0.0, start_s):.3f}",
+            "-i", str(src),
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+            "-movflags", "+faststart",
+            "-an",
+            str(dst),
         ],
         check=True,
     )
@@ -344,6 +482,7 @@ async def api_calibration_frame(request: Request) -> dict:
         out.write_bytes(data)
     url = "/videos/" + out.relative_to(DATA_RAW).as_posix()
     s["calibration_frame"] = url
+    _persist_session()
     await _broadcast_view({"type": "calibration_frame_ready", "url": url})
     await _broadcast_view({"type": "state", **_session_snapshot()})
     return {"ok": True, "url": url}
@@ -452,6 +591,7 @@ async def api_shot(request: Request) -> dict:
     slice_path = DATA_RAW / "sessions" / f"{s['stem']}_shot{n:02d}.mp4"
     slice_path.parent.mkdir(parents=True, exist_ok=True)
     slice_path.write_bytes(data)
+    _persist_session()
     clip_url = "/videos/" + slice_path.relative_to(DATA_RAW).as_posix()
     await _broadcast_view({
         "type": "shot_uploaded",
@@ -501,18 +641,50 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
         session["trajectories"].append(traj_path)
         with open(traj_path) as f:
             trajectory = yaml.safe_load(f)
-        tracked_url = "/processed/" + (DATA_PROCESSED / "tracked" / f"{slice_path.stem}_tracked.mp4").relative_to(DATA_PROCESSED).as_posix()
-        clip_url = "/videos/" + slice_path.relative_to(DATA_RAW).as_posix()
+        tracked_path = DATA_PROCESSED / "tracked" / f"{slice_path.stem}_tracked.mp4"
+        fps = float(trajectory.get("fps") or 240.0)
+        fw = trajectory.get("flight_window") or [1, 1]
+        start_s = max(0.0, (fw[0] - 1) / fps - 0.2)
+
+        # Trim both the raw clip and the tracked mp4 so playback starts at the flight.
+        clip_trim = slice_path.with_name(slice_path.stem + "_trim.mp4")
+        tracked_trim = tracked_path.with_name(tracked_path.stem + "_trim.mp4")
+        trim_offset_s = 0.0
+        if start_s > 0.05:
+            try:
+                _ffmpeg_trim(slice_path, clip_trim, start_s)
+                _ffmpeg_trim(tracked_path, tracked_trim, start_s)
+                clip_url = "/videos/" + clip_trim.relative_to(DATA_RAW).as_posix()
+                tracked_url = "/processed/" + tracked_trim.relative_to(DATA_PROCESSED).as_posix()
+                trim_offset_s = start_s
+                start_s = 0.0
+            except subprocess.CalledProcessError:
+                clip_url = "/videos/" + slice_path.relative_to(DATA_RAW).as_posix()
+                tracked_url = "/processed/" + tracked_path.relative_to(DATA_PROCESSED).as_posix()
+        else:
+            clip_url = "/videos/" + slice_path.relative_to(DATA_RAW).as_posix()
+            tracked_url = "/processed/" + tracked_path.relative_to(DATA_PROCESSED).as_posix()
+
         return {
             "tracked_url": tracked_url,
             "clip_url": clip_url,
             "trajectory": trajectory,
+            "start_s": start_s,
+            "trim_offset_s": trim_offset_s,
         }
 
-    result = await run_in_threadpool(_work)
+    try:
+        result = await run_in_threadpool(_work)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        await _broadcast_view({"type": "shot_failed", "shot": n, "reason": f"{type(e).__name__}: {e}"})
+        return
     if result is None:
         await _broadcast_view({"type": "shot_failed", "shot": n, "reason": "no flight detected"})
     else:
         payload = {"type": "shot_ready", "shot": n, **result}
         session["shots"].append(payload)
+        _persist_session()
         await _broadcast_view(payload)
+        await _broadcast_view({"type": "state", **_session_snapshot()})

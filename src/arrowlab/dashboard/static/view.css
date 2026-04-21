@@ -154,6 +154,7 @@ button:disabled { background: #1a1a1f; border-color: #222; color: #555; cursor: 
 .calib-stage {
   position: relative;
   display: inline-block;
+  align-self: flex-start;
   max-width: 100%;
   background: #000;
 }
@@ -255,6 +256,50 @@ button:disabled { background: #1a1a1f; border-color: #222; color: #555; cursor: 
 }
 
 /* ========== shoot tab ========== */
+
+.shot-history {
+  background: #0e0e13;
+  border: 1px solid #2a2a34;
+  border-radius: 3px;
+  padding: 0.35rem 0.5rem;
+}
+.shot-history-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: #aaa;
+  font-size: 0.8rem;
+}
+.shot-history-list {
+  display: flex;
+  gap: 0.3rem;
+  flex-wrap: wrap;
+}
+.shot-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.1rem 0.35rem;
+  background: #1b1b24;
+  border: 1px solid #333;
+  border-radius: 3px;
+  font-family: ui-monospace, monospace;
+  font-size: 0.75rem;
+  color: #ccc;
+  cursor: pointer;
+}
+.shot-chip:hover { background: #26263a; color: #fff; }
+.shot-chip.active { background: #3a5a80; border-color: #6090c0; color: #fff; }
+.shot-chip .del {
+  background: none;
+  border: none;
+  color: #e06060;
+  padding: 0 0.1rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+  line-height: 1;
+}
+.shot-chip .del:hover { color: #ff8080; }
 
 .last-shot { flex: 0 0 auto; }
 .shot-videos {

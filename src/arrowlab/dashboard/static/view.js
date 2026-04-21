@@ -70,6 +70,9 @@ const lastShot = document.getElementById("lastShot");
 const lastShotClip = document.getElementById("lastShotClip");
 const lastShotTracked = document.getElementById("lastShotTracked");
 const lastShotNum = document.getElementById("lastShotNum");
+const shotHistory = document.getElementById("shotHistory");
+const shotHistoryList = document.getElementById("shotHistoryList");
+let selectedShotIdx = null; // index into shots[] of the currently displayed shot
 const statsShotNum = document.getElementById("statsShotNum");
 const statSpeed = document.getElementById("statSpeed");
 const statTime = document.getElementById("statTime");
@@ -136,7 +139,11 @@ function applyState(st) {
   startSessionBtn.disabled = !!st.active;
   endSessionBtn.disabled = !st.active;
   captureFrameBtn.disabled = !(st.active && st.phone_connected);
-  shotBtn.disabled = !(st.active && st.phone_connected && st.has_annotation);
+  // Only take over the button when we're NOT mid-shot; during a shot the
+  // setShotButton() state machine owns the disabled flag.
+  if (!shotInFlight) {
+    shotBtn.disabled = !(st.active && st.phone_connected && st.has_annotation);
+  }
 
   // Fake-phone source scrubber (only in calibrate tab content)
   if (st.active && st.fake_source) {
@@ -177,12 +184,33 @@ function applyState(st) {
   // Clear shot history + telemetry when session ends
   if (!st.active) {
     shots.length = 0;
+    selectedShotIdx = null;
     lastShot.classList.add("hidden");
+    shotHistory.classList.add("hidden");
     lastShotClip.removeAttribute("src"); lastShotClip.load();
     lastShotTracked.removeAttribute("src"); lastShotTracked.load();
     telemetryInfo.textContent = "";
     updateStats();
     renderTelemetry();
+    renderShotHistory();
+  } else if (Array.isArray(st.shots)) {
+    // Sync persisted shots from server (reloaded session, or after delete)
+    const prevCount = shots.length;
+    shots.length = 0;
+    for (const sh of st.shots) shots.push(sh);
+    renderShotHistory();
+    if (shots.length === 0) {
+      selectedShotIdx = null;
+      lastShot.classList.add("hidden");
+      lastShotClip.removeAttribute("src"); lastShotClip.load();
+      lastShotTracked.removeAttribute("src"); lastShotTracked.load();
+      telemetryInfo.textContent = "";
+      updateStats();
+      renderTelemetry();
+    } else if (prevCount === 0 || selectedShotIdx == null || selectedShotIdx >= shots.length) {
+      // Auto-select latest on reload or when selection is gone
+      selectShot(shots.length - 1, { play: false });
+    }
   }
 
   currentRange = st.range || null;
@@ -256,21 +284,21 @@ function handleLiveMsg(msg) {
     updateCalibAnnotationView();
   } else if (msg.type === "shot_uploaded") {
     logLive(`shot ${msg.shot}: ${(msg.bytes / 1024 / 1024).toFixed(1)} MB uploaded, processing...`);
+    setShotButton("tracking");
   } else if (msg.type === "shot_ready") {
     logLive(`shot ${msg.shot}: ready`, "ok");
-    lastShotNum.textContent = msg.shot;
-    if (msg.clip_url) lastShotClip.src = msg.clip_url + "?t=" + Date.now();
-    if (msg.tracked_url) lastShotTracked.src = msg.tracked_url + "?t=" + Date.now();
-    lastShot.classList.remove("hidden");
-    playAllBtn.disabled = false;
-    pauseAllBtn.disabled = false;
-    shots.push(msg);
-    pendingShotIdx = shots.length - 1;
-    telemetryInfo.textContent = `${shots.length} shot${shots.length === 1 ? "" : "s"} (press Play to reveal)`;
-    updateStats();
-    sizeCanvas();
+    // shots[] is synced by the state broadcast that follows; just select the new one.
+    pendingShotIdx = shots.length; // the incoming shot will be appended at this index
+    // Defer selection until the state broadcast lands shots[]
+    setTimeout(() => {
+      const idx = shots.findIndex(sh => sh.shot === msg.shot);
+      if (idx >= 0) selectShot(idx, { play: false });
+    }, 50);
+    setShotButton("idle");
   } else if (msg.type === "shot_failed") {
     logLive(`shot ${msg.shot}: FAILED (${msg.reason || "unknown"})`, "error");
+    setShotButton("error");
+    setTimeout(() => setShotButton("idle"), 3000);
   } else if (msg.type === "error") {
     logLive(`error: ${msg.msg}`, "error");
   }
@@ -300,11 +328,94 @@ fakeCaptureBtn.addEventListener("click", () => {
   liveWS.send(JSON.stringify({ type: "request_calibration_frame", at_s: t }));
   logLive(`grabbing calibration frame at t=${t.toFixed(3)}s (fake scrub)...`);
 });
-shotBtn.addEventListener("click", () => {
-  if (liveWS && liveWS.readyState === WebSocket.OPEN) {
-    liveWS.send(JSON.stringify({ type: "trigger_shot" }));
-    logLive("SHOT! triggered");
+let shotInFlight = false;
+
+function setShotButton(state) {
+  switch (state) {
+    case "idle":
+      shotBtn.textContent = "SHOT!";
+      shotBtn.style.background = "";
+      shotInFlight = false;
+      break;
+    case "recording":
+      shotBtn.textContent = "⏺ RECORDING…";
+      shotBtn.style.background = "#b84040";
+      shotInFlight = true;
+      break;
+    case "uploading":
+      shotBtn.textContent = "⬆ UPLOADING…";
+      shotBtn.style.background = "#b0802e";
+      break;
+    case "tracking":
+      shotBtn.textContent = "⚙ TRACKING…";
+      shotBtn.style.background = "#406080";
+      break;
+    case "error":
+      shotBtn.textContent = "✖ FAILED — try again";
+      shotBtn.style.background = "#803030";
+      shotInFlight = false;
+      break;
   }
+  shotBtn.disabled = shotInFlight;
+}
+
+let countdownAbortToken = 0;
+
+function startShotCountdown() {
+  if (shotInFlight) return;
+  if (!(liveWS && liveWS.readyState === WebSocket.OPEN)) return;
+  shotInFlight = true;
+  const my = ++countdownAbortToken;
+  shotBtn.disabled = false; // keep enabled so user can abort on click
+  shotBtn.style.background = "#406080";
+
+  // Phase 1: 5s silent "walk away" buffer — pre-ring-buffer so operator motion doesn't leak in
+  let walkAway = 5;
+  const walkTick = () => {
+    if (my !== countdownAbortToken) return;
+    if (walkAway > 0) {
+      shotBtn.textContent = `walk away… ${walkAway}`;
+      walkAway--;
+      setTimeout(walkTick, 1000);
+    } else {
+      countTick();
+    }
+  };
+
+  // Phase 2: 5→1 countdown
+  let count = 5;
+  const countTick = () => {
+    if (my !== countdownAbortToken) return;
+    if (count > 0) {
+      shotBtn.textContent = `${count}…`;
+      count--;
+      setTimeout(countTick, 1000);
+    } else {
+      shotBtn.textContent = "🏹 SHOOT!";
+      shotBtn.style.background = "#c04040";
+      setTimeout(() => {
+        if (my !== countdownAbortToken) return;
+        liveWS.send(JSON.stringify({ type: "trigger_shot" }));
+        logLive("SHOT! triggered");
+        setShotButton("recording");
+      }, 1500);
+    }
+  };
+
+  walkTick();
+}
+
+function abortCountdown() {
+  countdownAbortToken++;
+  setShotButton("idle");
+}
+
+shotBtn.addEventListener("click", () => {
+  if (shotInFlight) {
+    abortCountdown();
+    return;
+  }
+  startShotCountdown();
 });
 
 // ==== Calibration annotation canvas ======================================
@@ -568,8 +679,21 @@ function renderTelemetry(currentTime = null) {
     telemetryCtx.stroke();
   }
 
-  // Target face
+  // Target bbox (from annotation)
   const t = ann.target;
+  if (t?.bbox && t.bbox.length === 4) {
+    const [bx0, by0, bx1, by1] = t.bbox;
+    telemetryCtx.strokeStyle = "#6a8fbf";
+    telemetryCtx.lineWidth = 1;
+    telemetryCtx.setLineDash([4, 3]);
+    telemetryCtx.strokeRect(
+      mapX(bx0), mapY(by0),
+      (bx1 - bx0) * sx, (by1 - by0) * sy,
+    );
+    telemetryCtx.setLineDash([]);
+  }
+
+  // Target face
   if (t && t.r && t.cx != null && t.cy != null) {
     const cx = mapX(t.cx), cy = mapY(t.cy), rBase = t.r * sAvg;
     const rings = [
@@ -621,7 +745,8 @@ function renderTelemetry(currentTime = null) {
     if (fit && traj?.fps) {
       const color = shotColor(pendingShotIdx);
       const clipStart = traj.clip_start_frame ?? fit.f0;
-      const frame = clipStart + currentTime * traj.fps;
+      const trimOffset = Number.isFinite(shot.trim_offset_s) ? shot.trim_offset_s : 0;
+      const frame = clipStart + (currentTime + trimOffset) * traj.fps;
       const f = Math.max(fit.f0, Math.min(fit.fHit, frame));
       const ax = fit.fx.slope * f + fit.fx.intercept;
       const ay = fit.fy.slope * f + fit.fy.intercept;
@@ -649,17 +774,69 @@ function renderTelemetry(currentTime = null) {
   }
 }
 
+// ==== Shot history =======================================================
+
+function renderShotHistory() {
+  shotHistoryList.innerHTML = "";
+  if (shots.length === 0) {
+    shotHistory.classList.add("hidden");
+    return;
+  }
+  shotHistory.classList.remove("hidden");
+  shots.forEach((sh, i) => {
+    const chip = document.createElement("span");
+    chip.className = "shot-chip" + (i === selectedShotIdx ? " active" : "");
+    chip.title = "click to view";
+    chip.innerHTML = `#${sh.shot}<button class="del" title="delete">✕</button>`;
+    chip.addEventListener("click", (e) => {
+      if (e.target.classList.contains("del")) return;
+      selectShot(i, { play: false });
+    });
+    chip.querySelector(".del").addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Delete shot #${sh.shot}?`)) return;
+      const res = await fetch(`/api/session/shot/${sh.shot}`, { method: "DELETE" });
+      if (!res.ok) logLive(`delete shot ${sh.shot} failed: ${await res.text()}`, "error");
+      else logLive(`deleted shot ${sh.shot}`);
+    });
+    shotHistoryList.appendChild(chip);
+  });
+}
+
+function selectShot(idx, { play = false } = {}) {
+  if (idx < 0 || idx >= shots.length) return;
+  selectedShotIdx = idx;
+  const sh = shots[idx];
+  lastShotNum.textContent = sh.shot;
+  if (sh.clip_url) lastShotClip.src = sh.clip_url + "?t=" + Date.now();
+  if (sh.tracked_url) lastShotTracked.src = sh.tracked_url + "?t=" + Date.now();
+  lastShot.classList.remove("hidden");
+  playAllBtn.disabled = false;
+  pauseAllBtn.disabled = false;
+  pendingShotIdx = idx;
+  telemetryInfo.textContent = `shot ${sh.shot} of ${shots.length} (press Play to reveal)`;
+  renderShotHistory();
+  updateStats();
+  sizeCanvas();
+  if (play) startSyncPlay();
+}
+
 // ==== Synced play ========================================================
 
 let playRaf = 0;
 function startSyncPlay() {
   if (shots.length === 0) return;
-  // Re-arm the latest shot as pending so its trajectory hides and animates
+  const idx = selectedShotIdx != null ? selectedShotIdx : shots.length - 1;
+  // Re-arm the selected shot as pending so its trajectory hides and animates
   // fresh on every Play press.
-  pendingShotIdx = shots.length - 1;
-  telemetryInfo.textContent = `${shots.length} shot${shots.length === 1 ? "" : "s"} (playing...)`;
-  try { lastShotClip.currentTime = 0; } catch {}
-  try { lastShotTracked.currentTime = 0; } catch {}
+  pendingShotIdx = idx;
+  telemetryInfo.textContent = `shot ${shots[idx].shot} (playing 0.0625×)`;
+  const shot = shots[idx] || {};
+  const startS = Number.isFinite(shot.start_s) ? shot.start_s : 0;
+  try { lastShotClip.currentTime = startS; } catch {}
+  try { lastShotTracked.currentTime = startS; } catch {}
+  lastShotClip.playbackRate = 0.0625;
+  lastShotTracked.playbackRate = 0.0625;
   Promise.all([lastShotClip.play(), lastShotTracked.play()]).catch(() => {});
   if (playRaf) cancelAnimationFrame(playRaf);
   const loop = () => {
@@ -753,7 +930,8 @@ function computeGroup(shots) {
 }
 
 function updateStats() {
-  const shot = shots[shots.length - 1];
+  const idx = selectedShotIdx != null ? selectedShotIdx : shots.length - 1;
+  const shot = shots[idx];
   if (!shot) {
     statsShotNum.textContent = "?";
     statSpeed.textContent = statTime.textContent = statDist.textContent =

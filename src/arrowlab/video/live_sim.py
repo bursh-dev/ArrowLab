@@ -87,7 +87,7 @@ def auto_detect_flight_in_clip(
     if scores.max() == 0:
         return None
     baseline = float(np.median(scores))
-    threshold = max(200.0, baseline * 3.0 + 50.0)
+    threshold = max(30.0, baseline * 3.0 + 20.0)
     above = scores > threshold
     idxs = np.where(above)[0]
     if len(idxs) == 0:
