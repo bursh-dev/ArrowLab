@@ -292,6 +292,7 @@ def _session_snapshot() -> dict:
         "has_range": bool(s and s["range"]),
         "calibration_frame": s["calibration_frame"] if s else None,
         "has_annotation": bool(s and s["annotation"]),
+        "annotation": s["annotation"] if s else None,
         "shot_count": s["shot_count"] if s else 0,
         "fake_source": s["fake_source"] if s else None,
         "shots": s["shots"] if s else [],
@@ -615,6 +616,8 @@ async def api_shot(request: Request) -> dict:
 
 
 async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
+    import time as _time
+    t_pipeline_start = _time.perf_counter()
     annotation = session["annotation"]
     if annotation is None:
         await _broadcast_view({"type": "shot_failed", "shot": n, "reason": "no annotation"})
@@ -702,7 +705,8 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
     if result is None:
         await _broadcast_view({"type": "shot_failed", "shot": n, "reason": "no flight detected"})
     else:
-        payload = {"type": "shot_ready", "shot": n, **result}
+        processing_s = _time.perf_counter() - t_pipeline_start
+        payload = {"type": "shot_ready", "shot": n, "processing_s": processing_s, **result}
         session["shots"].append(payload)
         _persist_session()
         await _broadcast_view(payload)

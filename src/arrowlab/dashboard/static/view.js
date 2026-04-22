@@ -79,6 +79,7 @@ const statTime = document.getElementById("statTime");
 const statDist = document.getElementById("statDist");
 const statOffset = document.getElementById("statOffset");
 const statEnergy = document.getElementById("statEnergy");
+const statProcessed = document.getElementById("statProcessed");
 const groupCount = document.getElementById("groupCount");
 const statExtreme = document.getElementById("statExtreme");
 const statMeanR = document.getElementById("statMeanR");
@@ -170,8 +171,17 @@ function applyState(st) {
       currentCalibUrl = st.calibration_frame;
       calib.imgLoaded = false;
       calib.pendingClicks = [];
-      calib.annotation = { corridor: null, target: null };
+      calib.annotation = st.annotation
+        ? { corridor: st.annotation.corridor || null, target: st.annotation.target || null }
+        : { corridor: null, target: null };
       calibImage.src = st.calibration_frame + (st.calibration_frame.includes("?") ? "&" : "?") + "t=" + Date.now();
+    } else if (st.annotation && !(calib.annotation.corridor || calib.annotation.target)) {
+      // Same image, but we just learned the saved annotation — hydrate and redraw.
+      calib.annotation = { corridor: st.annotation.corridor || null, target: st.annotation.target || null };
+      if (calib.imgLoaded) {
+        redrawCalib();
+        updateCalibAnnotationView();
+      }
     }
   } else {
     calibrationArea.classList.add("hidden");
@@ -425,6 +435,7 @@ calibImage.addEventListener("load", () => {
   calibOverlay.height = calibImage.naturalHeight;
   calib.imgLoaded = true;
   redrawCalib();
+  updateCalibAnnotationView();
 });
 for (const btn of calibModeBtns) {
   btn.addEventListener("click", () => setCalibMode(btn.dataset.mode));
@@ -715,12 +726,20 @@ function renderTelemetry(currentTime = null) {
     telemetryCtx.fill();
   }
 
-  // Per-shot static fit lines — skip the pending (unrevealed) one
+  // Per-shot static fit lines — skip the pending (unrevealed) one.
+  // Newest = fully opaque, each older step fades, after 5 oldest are gone.
+  const FADE_WINDOW = 5;
+  const newestIdx = shots.length - 1;
   shots.forEach((shot, i) => {
     if (i === pendingShotIdx) return;
-    const color = shotColor(i);
+    const age = newestIdx - i; // 0 = newest
+    if (age >= FADE_WINDOW) return;
+    const alpha = 1 - age / FADE_WINDOW; // 1.0, 0.8, 0.6, 0.4, 0.2
     const f = shotFit(shot);
     if (!f) return;
+    const color = shotColor(i);
+    telemetryCtx.save();
+    telemetryCtx.globalAlpha = alpha;
     telemetryCtx.strokeStyle = color;
     telemetryCtx.lineWidth = 1.5;
     telemetryCtx.lineCap = "round";
@@ -735,6 +754,7 @@ function renderTelemetry(currentTime = null) {
     telemetryCtx.fill();
     telemetryCtx.font = "600 11px ui-monospace, monospace";
     telemetryCtx.fillText(`#${shot.shot}`, mapX(f.hitX) + 6, mapY(f.hitY) - 6);
+    telemetryCtx.restore();
   });
 
   // Pending shot: trail grows with video time; no trail until Play pressed.
@@ -935,12 +955,13 @@ function updateStats() {
   if (!shot) {
     statsShotNum.textContent = "?";
     statSpeed.textContent = statTime.textContent = statDist.textContent =
-      statOffset.textContent = statEnergy.textContent = "—";
+      statOffset.textContent = statEnergy.textContent = statProcessed.textContent = "—";
     groupCount.textContent = "0";
     statExtreme.textContent = statMeanR.textContent = "—";
     return;
   }
   statsShotNum.textContent = shot.shot;
+  statProcessed.textContent = Number.isFinite(shot.processing_s) ? `${shot.processing_s.toFixed(1)} s` : "—";
   const s = computeShotStats(shot);
   if (s) {
     statSpeed.textContent = fmt(s.speedMs, 1, " m/s");
