@@ -291,15 +291,24 @@ def track_clip(
     min_area: int = 150,
     auto_flight: bool = False,
     log_prefix: str = "shot",
+    write_pre_pad_frames: int = 60,
+    write_post_pad_frames: int = 60,
+    frames: list | None = None,
 ) -> Path:
     """Process a pre-extracted clip and write tracked mp4 + trajectory yaml.
 
     `fw_start`/`fw_end` are in the SAME frame-numbering as clip_start_frame
     (e.g., if clip_start_frame=1, they're 1-indexed within the clip).
 
+    If `frames` is provided, skip decoding the clip from disk.
+
     Returns the trajectory yaml path.
     """
-    frames = read_all_frames(clip_path)
+    import time as _t
+    _t0 = _t.perf_counter()
+    if frames is None:
+        frames = read_all_frames(clip_path)
+    _t_decode = _t.perf_counter()
     if not frames:
         raise RuntimeError(f"no frames read from {clip_path}")
     if fps is None:
@@ -311,9 +320,13 @@ def track_clip(
         output_stem = clip_path.stem
 
     pre_count = max(1, fw_start - clip_start_frame)
-    bg_samples = frames[: min(pre_count, len(frames))]
-    if len(bg_samples) < 3:
-        bg_samples = frames
+    bg_pool = frames[: min(pre_count, len(frames))]
+    if len(bg_pool) < 3:
+        bg_pool = frames
+    # Subsample to ~15 evenly spaced frames before np.median — stacking hundreds
+    # of 1920x1080 frames burns gigabytes of RAM and seconds of CPU.
+    stride = max(1, len(bg_pool) // 15)
+    bg_samples = bg_pool[::stride][:15]
     bg_gray = cv2.cvtColor(
         np.median(np.stack(bg_samples), axis=0).astype(np.uint8),
         cv2.COLOR_BGR2GRAY,
@@ -357,6 +370,7 @@ def track_clip(
 
     raw_count = len(detections)
     cleaned = clean_trajectory(detections)
+    _t_detect = _t.perf_counter()
 
     TRACKED_DIR.mkdir(parents=True, exist_ok=True)
     tracked_path = TRACKED_DIR / f"{output_stem}_tracked.mp4"
@@ -369,9 +383,16 @@ def track_clip(
     kept_by_frame = {d["frame"]: d for d in cleaned}
     trail: list[tuple[int, int]] = []
 
+    # Only emit the flight window + small pre/post pad. Writing the full 6s ring
+    # buffer would cost ~30x more encoding time.
+    write_first_frame = max(clip_start_frame, fw_start - write_pre_pad_frames)
+    write_last_frame = min(clip_end_frame, fw_end + write_post_pad_frames)
+
     corridor = annotation.get("corridor")
     for i, f in enumerate(frames):
         global_frame = clip_start_frame + i
+        if global_frame < write_first_frame or global_frame > write_last_frame:
+            continue
         vis = f.copy()
         if corridor:
             cv2.line(vis, (0, corridor["y_top"]), (w, corridor["y_top"]), (200, 200, 0), 1)
@@ -401,8 +422,16 @@ def track_clip(
         )
         writer.write(vis)
     writer.release()
+    _t_write = _t.perf_counter()
     from arrowlab.video.encode import to_h264_faststart
     to_h264_faststart(tracked_path)
+    _t_encode = _t.perf_counter()
+    print(
+        f"{log_prefix}: decode2={_t_decode-_t0:.1f}s "
+        f"detect={_t_detect-_t_decode:.1f}s "
+        f"write={_t_write-_t_detect:.1f}s "
+        f"h264={_t_encode-_t_write:.1f}s"
+    )
 
     TRAJECTORY_DIR.mkdir(parents=True, exist_ok=True)
     traj_path = TRAJECTORY_DIR / f"{output_stem}.yaml"
@@ -419,6 +448,8 @@ def track_clip(
                 "clip_start_frame": clip_start_frame,
                 "clip_end_frame": clip_end_frame,
                 "flight_window": [fw_start, fw_end],
+                "tracked_first_frame": write_first_frame,
+                "tracked_last_frame": write_last_frame,
                 "annotation": annotation,
                 "detections_raw": raw_count,
                 "detections_kept": len(cleaned),

@@ -72,18 +72,20 @@ def auto_detect_flight_in_clip(
 ) -> tuple[int, int] | None:
     if not frames:
         return None
+    # Downsample for speed — motion-blob counting tolerates 1/2 linear scale well.
+    DS = 2
     bg_samples = frames[::max(1, len(frames) // 15)][:15]
-    bg_gray = cv2.cvtColor(
-        np.median(np.stack(bg_samples), axis=0).astype(np.uint8),
-        cv2.COLOR_BGR2GRAY,
-    )
+    bg_small = [cv2.cvtColor(cv2.resize(f, None, fx=1/DS, fy=1/DS, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY) for f in bg_samples]
+    bg_gray = np.median(np.stack(bg_small), axis=0).astype(np.uint8)
+    roi_small = cv2.resize(roi_mask, (bg_gray.shape[1], bg_gray.shape[0]), interpolation=cv2.INTER_NEAREST)
     scores = np.zeros(len(frames), dtype=np.int64)
     for i, f in enumerate(frames):
-        gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(f, None, fx=1/DS, fy=1/DS, interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         diff = cv2.absdiff(gray, bg_gray)
         _, mask = cv2.threshold(diff, diff_threshold, 255, cv2.THRESH_BINARY)
-        mask = cv2.bitwise_and(mask, roi_mask)
-        scores[i] = int(np.count_nonzero(mask))
+        mask = cv2.bitwise_and(mask, roi_small)
+        scores[i] = int(np.count_nonzero(mask)) * (DS * DS)  # rescale score to full-res pixel count
     if scores.max() == 0:
         return None
     baseline = float(np.median(scores))

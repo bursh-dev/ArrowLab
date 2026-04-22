@@ -12,7 +12,7 @@ def to_h264_faststart(path: Path) -> None:
             "ffmpeg", "-y", "-loglevel", "error",
             "-i", str(path),
             "-c:v", "libx264", "-pix_fmt", "yuv420p",
-            "-preset", "veryfast", "-crf", "20",
+            "-preset", "ultrafast", "-crf", "20",
             "-movflags", "+faststart",
             "-an",
             str(tmp),

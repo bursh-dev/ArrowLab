@@ -232,19 +232,27 @@ def _recover_shots_for_stem(stem: str) -> list[dict]:
             continue
         fps = float(trajectory.get("fps") or 240.0)
         fw = trajectory.get("flight_window") or [1, 1]
-        start_s = max(0.0, (fw[0] - 1) / fps - 0.2)
-        # Prefer trimmed versions if they exist
+        tfirst = trajectory.get("tracked_first_frame")
         clip_trim = clip_mp4.with_name(clip_mp4.stem + "_trim.mp4")
         tracked_trim = tracked_mp4.with_name(tracked_mp4.stem + "_trim.mp4")
-        trim_offset_s = 0.0
-        if clip_trim.exists() and tracked_trim.exists():
+
+        if tfirst is not None:
+            # New tracker: tracked_mp4 is already trimmed to its own frame window.
+            trim_offset_s = max(0.0, (int(tfirst) - 1) / fps)
+            out_tracked = tracked_mp4
+            out_clip = clip_trim if clip_trim.exists() else clip_mp4
+            start_s = 0.0 if clip_trim.exists() else trim_offset_s
+        elif clip_trim.exists() and tracked_trim.exists():
+            # Legacy sibling-trim shots
+            trim_offset_s = max(0.0, (fw[0] - 1) / fps - 0.2)
             out_clip = clip_trim
             out_tracked = tracked_trim
-            trim_offset_s = start_s
             start_s = 0.0
         else:
+            trim_offset_s = 0.0
             out_clip = clip_mp4
             out_tracked = tracked_mp4
+            start_s = max(0.0, (fw[0] - 1) / fps - 0.2)
         recovered.append({
             "type": "shot_ready",
             "shot": n,
@@ -437,21 +445,24 @@ def _extract_middle_jpeg(mp4: Path, out_jpeg: Path) -> None:
     )
 
 
-def _ffmpeg_trim(src: Path, dst: Path, start_s: float) -> None:
-    """Re-encode `src` into `dst`, dropping everything before start_s (frame-accurate)."""
+def _ffmpeg_trim(src: Path, dst: Path, start_s: float, duration_s: float | None = None) -> None:
+    """Re-encode `src` into `dst`, dropping everything before start_s (frame-accurate).
+    If duration_s is given, also cap the output length."""
     dst.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-ss", f"{max(0.0, start_s):.3f}",
-            "-i", str(src),
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
-            "-movflags", "+faststart",
-            "-an",
-            str(dst),
-        ],
-        check=True,
-    )
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-ss", f"{max(0.0, start_s):.3f}",
+        "-i", str(src),
+    ]
+    if duration_s is not None:
+        cmd += ["-t", f"{duration_s:.3f}"]
+    cmd += [
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+        "-movflags", "+faststart",
+        "-an",
+        str(dst),
+    ]
+    subprocess.run(cmd, check=True)
 
 
 def _looks_like_mp4(data: bytes) -> bool:
@@ -611,9 +622,11 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
 
     def _work() -> dict | None:
         import cv2
+        import time
         from arrowlab.video.live_sim import auto_detect_flight_in_clip
         from arrowlab.video.track import build_roi_mask, track_clip
 
+        t_start = time.perf_counter()
         cap = cv2.VideoCapture(str(slice_path))
         frames: list = []
         while True:
@@ -622,12 +635,15 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
                 break
             frames.append(f)
         cap.release()
+        t_decoded = time.perf_counter()
         if not frames:
             return None
         h, w = frames[0].shape[:2]
         roi = build_roi_mask((h, w), annotation)
         detected = auto_detect_flight_in_clip(frames, roi)
+        t_detected = time.perf_counter()
         if detected is None:
+            print(f"[shot {n}] decode={t_decoded-t_start:.1f}s detect={t_detected-t_decoded:.1f}s (NO FLIGHT)")
             return None
         a, b = detected
         traj_path = track_clip(
@@ -637,33 +653,36 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
             video_label=f"live shot {n}",
             shot_index=n - 1,
             log_prefix=f"[live] shot {n}",
+            frames=frames,
         )
+        t_tracked = time.perf_counter()
+        print(f"[shot {n}] decode={t_decoded-t_start:.1f}s detect={t_detected-t_decoded:.1f}s track={t_tracked-t_detected:.1f}s frames={len(frames)}")
         session["trajectories"].append(traj_path)
         with open(traj_path) as f:
             trajectory = yaml.safe_load(f)
         tracked_path = DATA_PROCESSED / "tracked" / f"{slice_path.stem}_tracked.mp4"
         fps = float(trajectory.get("fps") or 240.0)
-        fw = trajectory.get("flight_window") or [1, 1]
-        start_s = max(0.0, (fw[0] - 1) / fps - 0.2)
+        # Tracker already emits just the flight window + pad in tracked_path;
+        # its t=0 corresponds to original clip-frame `tracked_first_frame` (1-indexed).
+        tfirst = int(trajectory.get("tracked_first_frame") or 1)
+        tlast = int(trajectory.get("tracked_last_frame") or tfirst)
+        trim_offset_s = max(0.0, (tfirst - 1) / fps)
+        duration_s = max(0.1, (tlast - tfirst + 1) / fps)
 
-        # Trim both the raw clip and the tracked mp4 so playback starts at the flight.
+        # Trim the raw clip to the same [start, end] as the tracked mp4 so both
+        # videos play in lockstep. Tracked doesn't need re-trimming.
         clip_trim = slice_path.with_name(slice_path.stem + "_trim.mp4")
-        tracked_trim = tracked_path.with_name(tracked_path.stem + "_trim.mp4")
-        trim_offset_s = 0.0
-        if start_s > 0.05:
+        if trim_offset_s > 0.01:
             try:
-                _ffmpeg_trim(slice_path, clip_trim, start_s)
-                _ffmpeg_trim(tracked_path, tracked_trim, start_s)
+                _ffmpeg_trim(slice_path, clip_trim, trim_offset_s, duration_s)
                 clip_url = "/videos/" + clip_trim.relative_to(DATA_RAW).as_posix()
-                tracked_url = "/processed/" + tracked_trim.relative_to(DATA_PROCESSED).as_posix()
-                trim_offset_s = start_s
-                start_s = 0.0
             except subprocess.CalledProcessError:
                 clip_url = "/videos/" + slice_path.relative_to(DATA_RAW).as_posix()
-                tracked_url = "/processed/" + tracked_path.relative_to(DATA_PROCESSED).as_posix()
+                trim_offset_s = 0.0
         else:
             clip_url = "/videos/" + slice_path.relative_to(DATA_RAW).as_posix()
-            tracked_url = "/processed/" + tracked_path.relative_to(DATA_PROCESSED).as_posix()
+        tracked_url = "/processed/" + tracked_path.relative_to(DATA_PROCESSED).as_posix()
+        start_s = 0.0
 
         return {
             "tracked_url": tracked_url,
