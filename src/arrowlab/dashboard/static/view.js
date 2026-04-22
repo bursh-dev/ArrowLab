@@ -80,6 +80,14 @@ const statDist = document.getElementById("statDist");
 const statOffset = document.getElementById("statOffset");
 const statEnergy = document.getElementById("statEnergy");
 const statProcessed = document.getElementById("statProcessed");
+const timingsBreakdown = document.getElementById("timingsBreakdown");
+const timingDecode = document.getElementById("timingDecode");
+const timingDetect = document.getElementById("timingDetect");
+const timingTrack = document.getElementById("timingTrack");
+const timingTrim = document.getElementById("timingTrim");
+statProcessed.addEventListener("click", () => {
+  timingsBreakdown.classList.toggle("hidden");
+});
 const groupCount = document.getElementById("groupCount");
 const statExtreme = document.getElementById("statExtreme");
 const statMeanR = document.getElementById("statMeanR");
@@ -92,6 +100,18 @@ const telemetryCtx = telemetryCanvas.getContext("2d");
 const telemetryInfo = document.getElementById("telemetryInfo");
 const playAllBtn = document.getElementById("playAllBtn");
 const pauseAllBtn = document.getElementById("pauseAllBtn");
+const showAllShotsChk = document.getElementById("showAllShots");
+showAllShotsChk.addEventListener("change", () => renderTelemetry());
+
+// Calibration frame used as the telemetry background — "scene" view so the
+// trajectory overlays the actual capture, not an abstract box.
+const telemetryBg = new Image();
+let telemetryBgUrl = null;
+let telemetryBgLoaded = false;
+telemetryBg.addEventListener("load", () => {
+  telemetryBgLoaded = true;
+  sizeCanvas();
+});
 
 let liveWS = null;
 let currentCalibUrl = null;
@@ -110,7 +130,11 @@ const shots = [];
 let pendingShotIdx = null;
 
 // Last seen state, used to decide tab auto-advance
-const lastState = { active: false, has_range: false, has_annotation: false };
+const lastState = { active: false, has_range: false, has_annotation: false, phone_connected: false };
+
+function canShoot() {
+  return lastState.active && lastState.phone_connected && lastState.has_annotation;
+}
 
 function logLive(line, kind = "info") {
   const div = document.createElement("div");
@@ -166,6 +190,12 @@ function applyState(st) {
   // by tapping Grab calibration frame again (which fires request_calibration_frame
   // and clears the stored annotation by capturing a fresh frame).
   if (st.active && st.calibration_frame) {
+    // Preload calibration frame for the telemetry scene background
+    if (telemetryBgUrl !== st.calibration_frame) {
+      telemetryBgUrl = st.calibration_frame;
+      telemetryBgLoaded = false;
+      telemetryBg.src = st.calibration_frame + (st.calibration_frame.includes("?") ? "&" : "?") + "bg=" + Date.now();
+    }
     calibrationArea.classList.remove("hidden");
     if (currentCalibUrl !== st.calibration_frame) {
       currentCalibUrl = st.calibration_frame;
@@ -257,6 +287,10 @@ function applyState(st) {
   lastState.active = st.active;
   lastState.has_range = !!st.has_range;
   lastState.has_annotation = !!st.has_annotation;
+  lastState.phone_connected = !!st.phone_connected;
+  // Re-evaluate the SHOT button's disabled state after lastState updates
+  // (covers mid-countdown / mid-shot phone disconnects etc.).
+  shotBtn.disabled = shotInFlight || !canShoot();
 
   updateCalibAnnotationView();
 }
@@ -366,7 +400,9 @@ function setShotButton(state) {
       shotInFlight = false;
       break;
   }
-  shotBtn.disabled = shotInFlight;
+  // Always require an active session + connected phone + calibration.
+  // In-flight shots override (already checked above via shotInFlight gate).
+  shotBtn.disabled = shotInFlight || !canShoot();
 }
 
 let countdownAbortToken = 0;
@@ -569,7 +605,61 @@ function linearFit(xs, ys) {
   }
   if (den <= 0) return null;
   const slope = num / den;
-  return { slope, intercept: my - slope * mx };
+  const intercept = my - slope * mx;
+  return { slope, intercept, eval: (x) => slope * x + intercept };
+}
+
+// Draw a smooth curve through canvas-space points using midpoint smoothing
+// (quadraticCurveTo with each raw point as the control and the midpoint to
+// the next as the vertex). Hides per-frame detection jitter while still
+// tracing the actual path.
+function strokeSmoothCurve(pts) {
+  if (pts.length < 2) return;
+  telemetryCtx.beginPath();
+  telemetryCtx.moveTo(pts[0].x, pts[0].y);
+  if (pts.length === 2) {
+    telemetryCtx.lineTo(pts[1].x, pts[1].y);
+  } else {
+    for (let i = 1; i < pts.length - 1; i++) {
+      const p = pts[i], q = pts[i + 1];
+      const mx = (p.x + q.x) / 2;
+      const my = (p.y + q.y) / 2;
+      telemetryCtx.quadraticCurveTo(p.x, p.y, mx, my);
+    }
+    const last = pts[pts.length - 1];
+    telemetryCtx.quadraticCurveTo(
+      pts[pts.length - 2].x, pts[pts.length - 2].y,
+      last.x, last.y,
+    );
+  }
+  telemetryCtx.stroke();
+}
+
+// Keep the leading run of detections where x advances forward. Once the
+// arrow hits the target the tracker keeps firing on stuck-arrow / vibration
+// motion — x stops increasing or reverses. Cut there.
+function cleanDetections(dets) {
+  if (!dets || dets.length === 0) return [];
+  const out = [];
+  let maxX = -Infinity;
+  for (const d of dets) {
+    if (d.x < maxX - 5) break; // 5px backward slack for single-frame jitter
+    out.push(d);
+    if (d.x > maxX) maxX = d.x;
+  }
+  return out.length >= 3 ? out : dets;
+}
+
+// Y-fit over clean detections (linear is plenty for short flight windows
+// — full gravity arc is only a few pixels over this span).
+function yFitFromDets(dets) {
+  if (!dets || dets.length < 2) return null;
+  return linearFit(dets.map(d => d.frame), dets.map(d => d.y));
+}
+
+function xFitFromDets(dets) {
+  if (!dets || dets.length < 2) return null;
+  return linearFit(dets.map(d => d.frame), dets.map(d => d.x));
 }
 
 function shotColor(i) {
@@ -578,44 +668,10 @@ function shotColor(i) {
 }
 
 function getViewBox() {
+  // Full-frame view so the trajectory overlays the actual scene.
   const latest = shots[shots.length - 1]?.trajectory;
-  const imgW = latest?.width || 1920;
-  const imgH = latest?.height || 1080;
-  const t = latest?.annotation?.target;
-
-  if (t && t.cx != null && t.cy != null && t.r) {
-    // Span the actual flight horizontally so the arrow is on-canvas the whole
-    // time (same pacing as the videos), but keep vertical zoom tight so small
-    // differences between shots stand out.
-    const r = t.r;
-    let leftExtent = r * 20;
-    for (const shot of shots) {
-      const dets = shot.trajectory?.detections;
-      if (!dets || dets.length === 0) continue;
-      const firstX = dets[0].x;
-      leftExtent = Math.max(leftExtent, (t.cx - firstX) + r * 2);
-    }
-    const right = r * 4;
-    const vert = r * 5;
-    return {
-      x0: Math.max(0, t.cx - leftExtent),
-      y0: Math.max(0, t.cy - vert),
-      x1: Math.min(imgW, t.cx + right),
-      y1: Math.min(imgH, t.cy + vert),
-    };
-  }
-
-  const corridor = latest?.annotation?.corridor;
-  if (corridor) {
-    const band = corridor.y_bottom - corridor.y_top;
-    const pad = Math.round(band * 0.25);
-    return {
-      x0: 0,
-      y0: Math.max(0, corridor.y_top - pad),
-      x1: imgW,
-      y1: Math.min(imgH, corridor.y_bottom + pad),
-    };
-  }
+  const imgW = latest?.width || telemetryBg.naturalWidth || 1920;
+  const imgH = latest?.height || telemetryBg.naturalHeight || 1080;
   return { x0: 0, y0: 0, x1: imgW, y1: imgH };
 }
 
@@ -663,132 +719,148 @@ function renderTelemetry(currentTime = null) {
   telemetryCtx.fillStyle = "#0a0a0e";
   telemetryCtx.fillRect(0, 0, w, h);
 
-  if (shots.length === 0) return;
-
-  const latest = shots[shots.length - 1].trajectory;
-  const ann = latest.annotation || {};
   const vb = getViewBox();
   const vbW = vb.x1 - vb.x0;
   const vbH = vb.y1 - vb.y0;
   const sx = w / vbW;
   const sy = h / vbH;
-  const sAvg = (sx + sy) / 2;
   const mapX = (x) => (x - vb.x0) * sx;
   const mapY = (y) => (y - vb.y0) * sy;
 
-  // Corridor
-  if (ann.corridor) {
-    telemetryCtx.strokeStyle = "#444455";
-    telemetryCtx.lineWidth = 1;
-    telemetryCtx.beginPath();
-    telemetryCtx.moveTo(0, mapY(ann.corridor.y_top));
-    telemetryCtx.lineTo(w, mapY(ann.corridor.y_top));
-    telemetryCtx.stroke();
-    telemetryCtx.beginPath();
-    telemetryCtx.moveTo(0, mapY(ann.corridor.y_bottom));
-    telemetryCtx.lineTo(w, mapY(ann.corridor.y_bottom));
-    telemetryCtx.stroke();
+  // Scene background: the calibration JPEG, same frame the operator
+  // annotated. Dims the image so trajectories stand out.
+  if (telemetryBgLoaded) {
+    telemetryCtx.drawImage(telemetryBg, 0, 0, w, h);
+    telemetryCtx.fillStyle = "rgba(0,0,0,0.3)";
+    telemetryCtx.fillRect(0, 0, w, h);
   }
 
-  // Target bbox (from annotation)
-  const t = ann.target;
-  if (t?.bbox && t.bbox.length === 4) {
-    const [bx0, by0, bx1, by1] = t.bbox;
-    telemetryCtx.strokeStyle = "#6a8fbf";
-    telemetryCtx.lineWidth = 1;
-    telemetryCtx.setLineDash([4, 3]);
-    telemetryCtx.strokeRect(
-      mapX(bx0), mapY(by0),
-      (bx1 - bx0) * sx, (by1 - by0) * sy,
-    );
-    telemetryCtx.setLineDash([]);
-  }
+  if (shots.length === 0) return;
 
-  // Target face
-  if (t && t.r && t.cx != null && t.cy != null) {
-    const cx = mapX(t.cx), cy = mapY(t.cy), rBase = t.r * sAvg;
-    const rings = [
-      [rBase, "#ffffff"],
-      [rBase * 0.75, "#ff4040"],
-      [rBase * 0.5, "#ffcc00"],
-      [rBase * 0.25, "#ffff99"],
-    ];
-    for (const [rr, col] of rings) {
-      telemetryCtx.strokeStyle = col;
-      telemetryCtx.lineWidth = 1.5;
-      telemetryCtx.beginPath();
-      telemetryCtx.arc(cx, cy, rr, 0, Math.PI * 2);
-      telemetryCtx.stroke();
-    }
-    telemetryCtx.fillStyle = "#ffffff";
-    telemetryCtx.beginPath();
-    telemetryCtx.arc(cx, cy, 2, 0, Math.PI * 2);
-    telemetryCtx.fill();
-  }
-
-  // Per-shot static fit lines — skip the pending (unrevealed) one.
-  // Newest = fully opaque, each older step fades, after 5 oldest are gone.
+  // Per-shot trails: real detection dots for the clean forward run, then a
+  // dashed extrapolation via quadratic y-fit carries the trajectory on to
+  // the target. Noisy post-impact detections are dropped.
   const FADE_WINDOW = 5;
   const newestIdx = shots.length - 1;
-  shots.forEach((shot, i) => {
+  const showAll = showAllShotsChk.checked;
+  // When "show all" is off, suppress the entire static loop so the canvas
+  // only lights up during active Play (via the pending-shot block below).
+  if (showAll) shots.forEach((shot, i) => {
+    // The shot that's armed to fly (pendingShotIdx = currently selected) is
+    // never rendered statically — it only appears as the growing lit trail
+    // during Play. Older shots render normally.
     if (i === pendingShotIdx) return;
-    const age = newestIdx - i; // 0 = newest
+    const age = newestIdx - i;
     if (age >= FADE_WINDOW) return;
-    const alpha = 1 - age / FADE_WINDOW; // 1.0, 0.8, 0.6, 0.4, 0.2
-    const f = shotFit(shot);
-    if (!f) return;
+    const alpha = 1 - age / FADE_WINDOW;
+    const allDets = shot.trajectory?.detections || [];
+    if (allDets.length === 0) return;
+    const clean = cleanDetections(allDets);
     const color = shotColor(i);
     telemetryCtx.save();
     telemetryCtx.globalAlpha = alpha;
+    // Build one continuous point list: clean detections + extrapolated samples
+    // up to target.cx along the linear fit, shifted so the fit line passes
+    // exactly through the last clean detection — keeps the junction C0
+    // continuous so there's no visible "jump" into the extrapolation.
+    const pts = clean.map(d => ({ x: mapX(d.x), y: mapY(d.y) }));
+    const ann = shot.trajectory?.annotation || {};
+    const tx = ann.target?.cx;
+    const fx = xFitFromDets(clean);
+    const fy = yFitFromDets(clean);
+    if (tx != null && fx && fy) {
+      const last = clean[clean.length - 1];
+      const xOff = last.x - fx.eval(last.frame);
+      const yOff = last.y - fy.eval(last.frame);
+      const fHit = Math.abs(fx.slope) > 1e-6 ? (tx - fx.intercept - xOff) / fx.slope : last.frame;
+      // One extrapolated sample per frame — matches the detection density so
+      // the smoothed curve has uniform point spacing along the whole path.
+      const steps = Math.max(2, Math.round(fHit - last.frame));
+      for (let k = 1; k <= steps; k++) {
+        const fr = last.frame + (fHit - last.frame) * (k / steps);
+        pts.push({ x: mapX(fx.eval(fr) + xOff), y: mapY(fy.eval(fr) + yOff) });
+      }
+    }
     telemetryCtx.strokeStyle = color;
-    telemetryCtx.lineWidth = 1.5;
+    telemetryCtx.lineWidth = 2;
     telemetryCtx.lineCap = "round";
-    telemetryCtx.beginPath();
-    telemetryCtx.moveTo(mapX(f.startX), mapY(f.startY));
-    telemetryCtx.lineTo(mapX(f.hitX), mapY(f.hitY));
-    telemetryCtx.stroke();
-
-    telemetryCtx.fillStyle = color;
-    telemetryCtx.beginPath();
-    telemetryCtx.arc(mapX(f.hitX), mapY(f.hitY), 3.5, 0, Math.PI * 2);
-    telemetryCtx.fill();
+    telemetryCtx.lineJoin = "round";
+    strokeSmoothCurve(pts);
+    // Shot label: at the last point of the rendered curve.
+    const endPt = pts[pts.length - 1];
     telemetryCtx.font = "600 11px ui-monospace, monospace";
-    telemetryCtx.fillText(`#${shot.shot}`, mapX(f.hitX) + 6, mapY(f.hitY) - 6);
+    telemetryCtx.fillText(`#${shot.shot}`, endPt.x + 6, endPt.y - 6);
     telemetryCtx.restore();
   });
 
-  // Pending shot: trail grows with video time; no trail until Play pressed.
+  // Pending shot: whole trail drawn faintly, dots "lit up" as playback passes
+  // each detection frame, and a marker tracks the leading edge.
   if (pendingShotIdx != null && currentTime != null) {
     const shot = shots[pendingShotIdx];
-    const fit = shotFit(shot);
     const traj = shot.trajectory;
-    if (fit && traj?.fps) {
+    const dets = traj?.detections || [];
+    if (dets.length > 0 && traj?.fps) {
       const color = shotColor(pendingShotIdx);
-      const clipStart = traj.clip_start_frame ?? fit.f0;
+      const clipStart = traj.clip_start_frame ?? dets[0].frame;
       const trimOffset = Number.isFinite(shot.trim_offset_s) ? shot.trim_offset_s : 0;
       const frame = clipStart + (currentTime + trimOffset) * traj.fps;
-      const f = Math.max(fit.f0, Math.min(fit.fHit, frame));
-      const ax = fit.fx.slope * f + fit.fx.intercept;
-      const ay = fit.fy.slope * f + fit.fy.intercept;
-      // Growing trail from start to current arrow position
-      telemetryCtx.strokeStyle = color;
-      telemetryCtx.lineWidth = 1.5;
-      telemetryCtx.lineCap = "round";
-      telemetryCtx.beginPath();
-      telemetryCtx.moveTo(mapX(fit.startX), mapY(fit.startY));
-      telemetryCtx.lineTo(mapX(ax), mapY(ay));
-      telemetryCtx.stroke();
-      // Moving arrow marker
-      if (frame >= fit.f0 && frame <= fit.fHit) {
-        telemetryCtx.fillStyle = "#ffffff";
+      const clean = cleanDetections(dets);
+      // Build continuous path: clean detections + fit-extrapolation to target
+      const tx0 = traj?.annotation?.target?.cx;
+      const fx0 = xFitFromDets(clean);
+      const fy0 = yFitFromDets(clean);
+      const fullPts = clean.map(d => ({ x: mapX(d.x), y: mapY(d.y), f: d.frame }));
+      let fHit0 = null;
+      if (tx0 != null && fx0 && fy0) {
+        const last = clean[clean.length - 1];
+        const xOff = last.x - fx0.eval(last.frame);
+        const yOff = last.y - fy0.eval(last.frame);
+        fHit0 = Math.abs(fx0.slope) > 1e-6 ? (tx0 - fx0.intercept - xOff) / fx0.slope : last.frame;
+        // One extrapolated sample per frame — same density as real detections,
+        // so the marker moves at identical frame-rate through both regions.
+        const steps = Math.max(2, Math.round(fHit0 - last.frame));
+        for (let k = 1; k <= steps; k++) {
+          const fr = last.frame + (fHit0 - last.frame) * (k / steps);
+          fullPts.push({ x: mapX(fx0.eval(fr) + xOff), y: mapY(fy0.eval(fr) + yOff), f: fr });
+        }
+      }
+      // (Faint pre-drawn baseline removed — the lit trail is the only render
+      // of the pending shot so the animation grows cleanly from zero.)
+      // Lit-up portion: same curve from start up to current playback frame
+      let litIdx = -1;
+      for (let i = 0; i < fullPts.length; i++) {
+        if (fullPts[i].f > frame) break;
+        litIdx = i;
+      }
+      if (litIdx >= 1) {
+        telemetryCtx.strokeStyle = color;
+        telemetryCtx.lineWidth = 2.5;
+        strokeSmoothCurve(fullPts.slice(0, litIdx + 1));
+      }
+      // Marker: walk fullPts by its f value so the dot rides the already-drawn
+      // continuous curve (detections + extrapolation alike).
+      let markerX = null, markerY = null;
+      if (frame >= fullPts[0]?.f) {
+        let idx = 0;
+        for (let i = 0; i < fullPts.length; i++) {
+          if (fullPts[i].f > frame) break;
+          idx = i;
+        }
+        if (idx < fullPts.length - 1) {
+          const a = fullPts[idx], b = fullPts[idx + 1];
+          const t = Math.max(0, Math.min(1, (frame - a.f) / (b.f - a.f)));
+          markerX = a.x + (b.x - a.x) * t;
+          markerY = a.y + (b.y - a.y) * t;
+        } else {
+          markerX = fullPts[idx].x; markerY = fullPts[idx].y;
+        }
+      }
+      if (markerX != null) {
         telemetryCtx.strokeStyle = "#ffffff";
         telemetryCtx.lineWidth = 2;
         telemetryCtx.beginPath();
-        telemetryCtx.arc(mapX(ax), mapY(ay), 6, 0, Math.PI * 2);
+        telemetryCtx.arc(markerX, markerY, 6, 0, Math.PI * 2);
         telemetryCtx.stroke();
-        telemetryCtx.beginPath();
-        telemetryCtx.arc(mapX(ax), mapY(ay), 2, 0, Math.PI * 2);
-        telemetryCtx.fill();
       }
     }
   }
@@ -844,6 +916,7 @@ function selectShot(idx, { play = false } = {}) {
 // ==== Synced play ========================================================
 
 let playRaf = 0;
+let playActive = false;
 function startSyncPlay() {
   if (shots.length === 0) return;
   const idx = selectedShotIdx != null ? selectedShotIdx : shots.length - 1;
@@ -858,19 +931,30 @@ function startSyncPlay() {
   lastShotClip.playbackRate = 0.0625;
   lastShotTracked.playbackRate = 0.0625;
   Promise.all([lastShotClip.play(), lastShotTracked.play()]).catch(() => {});
+  playActive = true;
   if (playRaf) cancelAnimationFrame(playRaf);
   const loop = () => {
-    renderTelemetry(lastShotClip.currentTime);
-    if (!lastShotClip.paused && !lastShotClip.ended) {
-      playRaf = requestAnimationFrame(loop);
-    } else {
+    if (!playActive) { playRaf = 0; renderTelemetry(); return; }
+    // Prefer whichever video is actually progressing; raw trim may have a
+    // broken duration or load slower than the tracked.
+    const trackedEnded = lastShotTracked.ended;
+    const rawEnded = lastShotClip.ended;
+    const src = (!rawEnded && lastShotClip.currentTime > 0)
+      ? lastShotClip
+      : (!trackedEnded ? lastShotTracked : lastShotClip);
+    renderTelemetry(src.currentTime);
+    if (rawEnded && trackedEnded) {
+      playActive = false;
       playRaf = 0;
       renderTelemetry();
+    } else {
+      playRaf = requestAnimationFrame(loop);
     }
   };
   playRaf = requestAnimationFrame(loop);
 }
 function stopSyncPlay() {
+  playActive = false;
   lastShotClip.pause();
   lastShotTracked.pause();
   if (playRaf) { cancelAnimationFrame(playRaf); playRaf = 0; }
@@ -879,11 +963,9 @@ function stopSyncPlay() {
 playAllBtn.addEventListener("click", startSyncPlay);
 pauseAllBtn.addEventListener("click", stopSyncPlay);
 lastShotClip.addEventListener("ended", () => {
-  if (playRaf) { cancelAnimationFrame(playRaf); playRaf = 0; }
-  // Playback done — promote pending shot to the static view
-  pendingShotIdx = null;
+  // The RAF loop exits itself once both videos report ended. Just refresh
+  // the info text here.
   telemetryInfo.textContent = `${shots.length} shot${shots.length === 1 ? "" : "s"}`;
-  renderTelemetry();
 });
 
 // ==== Shot stats =========================================================
@@ -962,6 +1044,13 @@ function updateStats() {
   }
   statsShotNum.textContent = shot.shot;
   statProcessed.textContent = Number.isFinite(shot.processing_s) ? `${shot.processing_s.toFixed(1)} s` : "—";
+  const tim = shot.timings;
+  const missing = !tim;
+  const fmtS = (v) => (missing ? "not recorded" : (Number.isFinite(v) ? `${v.toFixed(1)} s` : "—"));
+  timingDecode.textContent = fmtS(tim?.decode_s);
+  timingDetect.textContent = fmtS(tim?.detect_s);
+  timingTrack.textContent = fmtS(tim?.track_s);
+  timingTrim.textContent = fmtS(tim?.trim_s);
   const s = computeShotStats(shot);
   if (s) {
     statSpeed.textContent = fmt(s.speedMs, 1, " m/s");

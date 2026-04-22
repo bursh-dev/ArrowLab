@@ -113,6 +113,10 @@
         <button id="shotBtn" class="shot-btn" disabled>SHOT!</button>
         <button id="playAllBtn" disabled>▶ Play</button>
         <button id="pauseAllBtn" disabled>⏸ Pause</button>
+        <label class="shoot-toggle">
+          <input type="checkbox" id="showAllShots" checked />
+          show all shots
+        </label>
         <span class="shoot-hint">calibration required before shooting</span>
       </div>
 
@@ -142,7 +146,13 @@
                 <dt>Distance</dt><dd id="statDist">—</dd>
                 <dt>Hit offset</dt><dd id="statOffset">—</dd>
                 <dt>Energy</dt><dd id="statEnergy">—</dd>
-                <dt>Processed in</dt><dd id="statProcessed">—</dd>
+                <dt>Processed in</dt><dd id="statProcessed" class="stat-toggle" title="click for breakdown">—</dd>
+              </dl>
+              <dl id="timingsBreakdown" class="hidden timings-breakdown">
+                <dt>decode</dt><dd id="timingDecode">—</dd>
+                <dt>detect</dt><dd id="timingDetect">—</dd>
+                <dt>track</dt><dd id="timingTrack">—</dd>
+                <dt>trim</dt><dd id="timingTrim">—</dd>
               </dl>
             </div>
             <div class="stats-block">

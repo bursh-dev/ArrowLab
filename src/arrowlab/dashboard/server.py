@@ -446,9 +446,17 @@ def _extract_middle_jpeg(mp4: Path, out_jpeg: Path) -> None:
     )
 
 
-def _ffmpeg_trim(src: Path, dst: Path, start_s: float, duration_s: float | None = None) -> None:
+def _ffmpeg_trim(
+    src: Path,
+    dst: Path,
+    start_s: float,
+    duration_s: float | None = None,
+    fps: float | None = None,
+) -> None:
     """Re-encode `src` into `dst`, dropping everything before start_s (frame-accurate).
-    If duration_s is given, also cap the output length."""
+    If duration_s is given, also cap the output length.
+    If fps is given, force constant framerate on the output (so two parallel clips
+    — raw + tracked — share the same timebase and stay in sync when played together)."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
@@ -457,6 +465,8 @@ def _ffmpeg_trim(src: Path, dst: Path, start_s: float, duration_s: float | None 
     ]
     if duration_s is not None:
         cmd += ["-t", f"{duration_s:.3f}"]
+    if fps is not None and fps > 0:
+        cmd += ["-vf", f"fps={fps:.6f}"]
     cmd += [
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
         "-movflags", "+faststart",
@@ -659,7 +669,12 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
             frames=frames,
         )
         t_tracked = time.perf_counter()
-        print(f"[shot {n}] decode={t_decoded-t_start:.1f}s detect={t_detected-t_decoded:.1f}s track={t_tracked-t_detected:.1f}s frames={len(frames)}")
+        timings_s = {
+            "decode_s": round(t_decoded - t_start, 3),
+            "detect_s": round(t_detected - t_decoded, 3),
+            "track_s": round(t_tracked - t_detected, 3),
+        }
+        print(f"[shot {n}] decode={timings_s['decode_s']}s detect={timings_s['detect_s']}s track={timings_s['track_s']}s frames={len(frames)}")
         session["trajectories"].append(traj_path)
         with open(traj_path) as f:
             trajectory = yaml.safe_load(f)
@@ -672,18 +687,29 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
         trim_offset_s = max(0.0, (tfirst - 1) / fps)
         duration_s = max(0.1, (tlast - tfirst + 1) / fps)
 
-        # Trim the raw clip to the same [start, end] as the tracked mp4 so both
-        # videos play in lockstep. Tracked doesn't need re-trimming.
+        # Write the raw trim with cv2 from the same already-decoded frame slice
+        # [tfirst-1 .. tlast-1] that the tracker wrote. This guarantees identical
+        # timestamps / frame count / fps as the tracked mp4, so the two clips
+        # stay in sync at slow playback. (ffmpeg -vf fps resampled the phone's
+        # VFR mp4 non-uniformly and drifted visibly.)
+        writer_fps_int = max(1, int(round(fps)))
         clip_trim = slice_path.with_name(slice_path.stem + "_trim.mp4")
-        if trim_offset_s > 0.01:
-            try:
-                _ffmpeg_trim(slice_path, clip_trim, trim_offset_s, duration_s)
-                clip_url = "/videos/" + clip_trim.relative_to(DATA_RAW).as_posix()
-            except subprocess.CalledProcessError:
-                clip_url = "/videos/" + slice_path.relative_to(DATA_RAW).as_posix()
-                trim_offset_s = 0.0
-        else:
-            clip_url = "/videos/" + slice_path.relative_to(DATA_RAW).as_posix()
+        from arrowlab.video.encode import to_h264_faststart
+        raw_writer = cv2.VideoWriter(
+            str(clip_trim),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            float(writer_fps_int),
+            (w, h),
+        )
+        try:
+            for i in range(tfirst - 1, min(tlast, len(frames))):
+                raw_writer.write(frames[i])
+        finally:
+            raw_writer.release()
+        to_h264_faststart(clip_trim)
+        t_trimmed = time.perf_counter()
+        timings_s["trim_s"] = round(t_trimmed - t_tracked, 3)
+        clip_url = "/videos/" + clip_trim.relative_to(DATA_RAW).as_posix()
         tracked_url = "/processed/" + tracked_path.relative_to(DATA_PROCESSED).as_posix()
         start_s = 0.0
 
@@ -693,6 +719,7 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
             "trajectory": trajectory,
             "start_s": start_s,
             "trim_offset_s": trim_offset_s,
+            "timings": timings_s,
         }
 
     try:

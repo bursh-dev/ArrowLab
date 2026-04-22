@@ -116,6 +116,16 @@ button:disabled { background: #1a1a1f; border-color: #222; color: #555; cursor: 
   align-items: center;
 }
 .shoot-hint { color: #888; font-size: 0.8rem; }
+.shoot-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  color: #bbb;
+  font-size: 0.8rem;
+  user-select: none;
+  cursor: pointer;
+}
+.shoot-toggle input { margin: 0; }
 
 /* ========== calibration ========== */
 
@@ -340,6 +350,17 @@ button:disabled { background: #1a1a1f; border-color: #222; color: #555; cursor: 
   font-family: ui-monospace, monospace;
   text-align: right;
 }
+.stat-toggle { cursor: pointer; border-bottom: 1px dotted #666; }
+.stat-toggle:hover { color: #9ef89f; }
+.timings-breakdown {
+  margin: 0.25rem 0 0 0 !important;
+  padding: 0.25rem 0.5rem;
+  border-left: 2px solid #3a5a80;
+  background: #14141b;
+  font-size: 0.72rem;
+  grid-template-columns: auto 1fr;
+}
+.timings-breakdown dt { color: #6a8fbf !important; }
 .shot-videos figure {
   margin: 0;
   display: flex;
