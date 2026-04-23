@@ -75,7 +75,9 @@ const shotHistoryList = document.getElementById("shotHistoryList");
 let selectedShotIdx = null; // index into shots[] of the currently displayed shot
 const statsShotNum = document.getElementById("statsShotNum");
 const statSpeed = document.getElementById("statSpeed");
+const statSpeedAudio = document.getElementById("statSpeedAudio");
 const statTime = document.getElementById("statTime");
+const statTimeAudio = document.getElementById("statTimeAudio");
 const statDist = document.getElementById("statDist");
 const statOffset = document.getElementById("statOffset");
 const statEnergy = document.getElementById("statEnergy");
@@ -1037,7 +1039,8 @@ function updateStats() {
   if (!shot) {
     statsShotNum.textContent = "?";
     statSpeed.textContent = statTime.textContent = statDist.textContent =
-      statOffset.textContent = statEnergy.textContent = statProcessed.textContent = "—";
+      statOffset.textContent = statEnergy.textContent = statProcessed.textContent =
+      statSpeedAudio.textContent = statTimeAudio.textContent = "—";
     groupCount.textContent = "0";
     statExtreme.textContent = statMeanR.textContent = "—";
     return;
@@ -1060,6 +1063,16 @@ function updateStats() {
     statEnergy.textContent = s.keJ != null
       ? `${s.keJ.toFixed(1)} J / ${s.keFtLbs.toFixed(1)} ft·lbs`
       : "— (need arrow mass)";
+  }
+  // Audio-derived chronograph values (independent of tracker)
+  statSpeedAudio.textContent = Number.isFinite(shot.speed_audio_ms)
+    ? fmt(shot.speed_audio_ms, 1, " m/s")
+    : "—";
+  if (Number.isFinite(shot.audio_release_s) && Number.isFinite(shot.audio_impact_s)) {
+    const gapMs = (shot.audio_impact_s - shot.audio_release_s) * 1000;
+    statTimeAudio.textContent = fmt(gapMs, 0, " ms");
+  } else {
+    statTimeAudio.textContent = "—";
   }
   const g = computeGroup(shots);
   groupCount.textContent = g.count;

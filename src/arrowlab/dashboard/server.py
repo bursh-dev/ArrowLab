@@ -476,6 +476,85 @@ def _ffmpeg_trim(
     subprocess.run(cmd, check=True)
 
 
+def _detect_audio_events(mp4_path: Path) -> dict:
+    """Return {'release_s','impact_s'} from the mp4's audio track, or Nones
+    if audio is missing / no clear transients found. Simple two-peak energy
+    detector — good enough as a first cut; per-session matched-filter
+    templates come later."""
+    import numpy as np
+    sr = 16_000
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-nostdin",
+            "-i", str(mp4_path),
+            "-f", "f32le", "-ac", "1", "-ar", str(sr),
+            "-",
+        ],
+        capture_output=True,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        return {"release_s": None, "impact_s": None}
+    audio = np.frombuffer(proc.stdout, dtype=np.float32)
+    if audio.size < sr // 10:
+        return {"release_s": None, "impact_s": None}
+
+    # Smooth energy envelope over a 5 ms window.
+    env = np.abs(audio)
+    win = max(1, int(sr * 0.005))
+    cs = np.cumsum(np.concatenate([[0.0], env]))
+    env_smooth = (cs[win:] - cs[:-win]) / win
+
+    noise = float(np.median(env_smooth))
+    peak = float(env_smooth.max())
+    if peak < noise * 5.0:
+        return {"release_s": None, "impact_s": None}
+
+    # Impact = the single loudest sample in the envelope (arrow hitting a
+    # target is usually by far the loudest transient on the track).
+    impact_idx = int(np.argmax(env_smooth))
+
+    # Release = the loudest peak in the 500 ms window BEFORE impact, with a
+    # 80 ms guard zone so we don't pick impact's ramp-up. If no peak stands
+    # out above the noise floor, we give up on release and return None.
+    min_pre_gap = int(sr * 0.08)
+    max_pre_gap = int(sr * 0.5)
+    win_start = max(0, impact_idx - max_pre_gap)
+    win_end = max(0, impact_idx - min_pre_gap)
+    release_idx = None
+    if win_end > win_start:
+        seg = env_smooth[win_start:win_end]
+        if seg.size > 0 and float(seg.max()) > noise * 4.0:
+            release_idx = win_start + int(np.argmax(seg))
+
+    def idx_to_s(i: int) -> float:
+        return float((i + win / 2) / sr)
+
+    return {
+        "release_s": idx_to_s(release_idx) if release_idx is not None else None,
+        "impact_s": idx_to_s(impact_idx),
+    }
+
+
+def _audio_chronograph_speed_ms(release_s: float | None, impact_s: float | None, rng: dict | None) -> float | None:
+    """Arrow speed from two acoustic timestamps, corrected for the sound-
+    propagation delay between mic (at the camera) and the two sources
+    (bow at shooter, arrow-impact at target)."""
+    if release_s is None or impact_s is None or rng is None:
+        return None
+    D = rng.get("shooter_to_target_m")
+    if not D or D <= 0:
+        return None
+    cp = float(rng.get("camera_perpendicular_m") or 0.0)
+    ca = float(rng.get("camera_along_m") if rng.get("camera_along_m") is not None else D / 2.0)
+    c = 343.0
+    d_mic_shooter = (ca * ca + cp * cp) ** 0.5
+    d_mic_target = ((D - ca) ** 2 + cp * cp) ** 0.5
+    gap_corrected = (impact_s - release_s) - (d_mic_target - d_mic_shooter) / c
+    if gap_corrected <= 0:
+        return None
+    return float(D / gap_corrected)
+
+
 def _merge_audio_from_source(src_mp4: Path, video_only_mp4: Path, start_s: float, dur_s: float) -> None:
     """Add an audio track to `video_only_mp4` by copying `dur_s` of audio from
     `src_mp4` starting at `start_s`. Overwrites `video_only_mp4` with the
@@ -737,6 +816,18 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
             pass  # No audio track / ffmpeg failure -> silent clip, fine.
         t_trimmed = time.perf_counter()
         timings_s["trim_s"] = round(t_trimmed - t_tracked, 3)
+
+        # Audio onset detection: pull release + impact timestamps out of the
+        # source mp4's audio track. `speed_audio_ms` is the chronograph
+        # derivation — independent of the visual tracker, so it's a cross-
+        # check on the pixel-based speed metric.
+        audio_events = _detect_audio_events(slice_path)
+        speed_audio_ms = _audio_chronograph_speed_ms(
+            audio_events.get("release_s"),
+            audio_events.get("impact_s"),
+            session.get("range"),
+        )
+        timings_s["audio_s"] = round(time.perf_counter() - t_trimmed, 3)
         clip_url = "/videos/" + clip_trim.relative_to(DATA_RAW).as_posix()
         tracked_url = "/processed/" + tracked_path.relative_to(DATA_PROCESSED).as_posix()
         start_s = 0.0
@@ -748,6 +839,9 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
             "start_s": start_s,
             "trim_offset_s": trim_offset_s,
             "timings": timings_s,
+            "audio_release_s": audio_events.get("release_s"),
+            "audio_impact_s": audio_events.get("impact_s"),
+            "speed_audio_ms": speed_audio_ms,
         }
 
     try:
