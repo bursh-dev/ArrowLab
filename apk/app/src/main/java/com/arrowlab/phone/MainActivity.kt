@@ -76,15 +76,27 @@ class MainActivity : AppCompatActivity() {
 
     private var cameraController: CameraController? = null
 
-    private val cameraPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) {
-            appendLog("camera permission granted", ok = true)
+    private val permissionsLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        // Re-check actual permission state (the launcher's result only
+        // contains what we asked for in this launch).
+        val cameraOk = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
+        val micOk = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        if (cameraOk) {
+            appendLog(
+                "permissions ok: camera${if (micOk) " + mic" else " (no mic)"}",
+                ok = true,
+            )
             cameraController?.start()
         } else {
-            appendLog("camera permission denied — Phase 2 disabled", error = true)
+            appendLog("camera permission denied — capture disabled", error = true)
         }
+        if (!micOk) appendLog("mic permission denied — shots will have no audio", error = true)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -138,11 +150,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun ensureCameraPermission() {
+        val needed = mutableListOf<String>()
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-            == PackageManager.PERMISSION_GRANTED) {
+            != PackageManager.PERMISSION_GRANTED) needed += Manifest.permission.CAMERA
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED) needed += Manifest.permission.RECORD_AUDIO
+        if (needed.isEmpty()) {
             cameraController?.start()
         } else {
-            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+            permissionsLauncher.launch(needed.toTypedArray())
         }
     }
 
@@ -175,7 +191,7 @@ class MainActivity : AppCompatActivity() {
     private suspend fun discoverServer(port: Int): String? {
         // Try USB reverse-tether first (fast single-probe, no LAN needed).
         if (withContext(Dispatchers.IO) { probe("127.0.0.1", port) }) {
-            appendLog("discovery: USB reverse-tether hit (127.0.0.1)")
+            appendLog("discovery: USB reverx`se-tether hit (127.0.0.1)")
             return "127.0.0.1"
         }
         // Try last-known-good IP (saved on prior successful connect).

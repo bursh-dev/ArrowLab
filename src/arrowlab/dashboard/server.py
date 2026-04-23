@@ -476,6 +476,27 @@ def _ffmpeg_trim(
     subprocess.run(cmd, check=True)
 
 
+def _merge_audio_from_source(src_mp4: Path, video_only_mp4: Path, start_s: float, dur_s: float) -> None:
+    """Add an audio track to `video_only_mp4` by copying `dur_s` of audio from
+    `src_mp4` starting at `start_s`. Overwrites `video_only_mp4` with the
+    audio-merged result. Raises if `src_mp4` has no audio stream."""
+    tmp = video_only_mp4.with_suffix(video_only_mp4.suffix + ".withaudio.mp4")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", str(video_only_mp4),
+            "-ss", f"{max(0.0, start_s):.3f}", "-t", f"{dur_s:.3f}", "-i", str(src_mp4),
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "64k",
+            "-movflags", "+faststart",
+            str(tmp),
+        ],
+        check=True,
+    )
+    tmp.replace(video_only_mp4)
+
+
 def _looks_like_mp4(data: bytes) -> bool:
     return len(data) >= 12 and data[4:8] == b"ftyp"
 
@@ -707,6 +728,13 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
         finally:
             raw_writer.release()
         to_h264_faststart(clip_trim)
+        # Remux: take video from our cv2-written trim, audio from the same
+        # window of the source mp4 (if it has an audio track). Gives the
+        # operator an audible raw clip without changing video timestamps.
+        try:
+            _merge_audio_from_source(slice_path, clip_trim, trim_offset_s, duration_s)
+        except Exception:
+            pass  # No audio track / ffmpeg failure -> silent clip, fine.
         t_trimmed = time.perf_counter()
         timings_s["trim_s"] = round(t_trimmed - t_tracked, 3)
         clip_url = "/videos/" + clip_trim.relative_to(DATA_RAW).as_posix()

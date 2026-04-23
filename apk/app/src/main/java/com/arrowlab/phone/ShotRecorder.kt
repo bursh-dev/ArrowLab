@@ -1,18 +1,24 @@
 package com.arrowlab.phone
 
+import android.media.AudioFormat
+import android.media.AudioRecord
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
+import android.media.MediaRecorder
+import android.os.SystemClock
 import android.view.Surface
 import java.io.File
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentLinkedDeque
 
 /**
- * Continuously drains a MediaCodec H.264 encoder into a rolling ring buffer of
- * encoded NAL units keyed by presentation timestamp. On demand, muxes a recent
- * window into an in-memory MP4 suitable for `POST /api/shot`.
+ * Continuously drains MediaCodec H.264 (video) and AAC-LC (audio) encoders
+ * into rolling ring buffers keyed by presentation timestamp (microseconds,
+ * SystemClock.elapsedRealtimeNanos-based for both tracks so they share a
+ * timebase). On demand, muxes a recent window into an in-memory MP4 with
+ * both tracks.
  */
 class ShotRecorder(
     private val width: Int,
@@ -30,18 +36,68 @@ class ShotRecorder(
         val isConfig: Boolean,
     )
 
+    private data class AudioSample(val bytes: ByteArray, val ptsUs: Long)
+
     private val ringBuffer = ConcurrentLinkedDeque<Nal>()
+    private val audioBuffer = ConcurrentLinkedDeque<AudioSample>()
     private val bufferMaxUs = (bufferSeconds * 1_000_000).toLong()
+
+    // Video
     private var encoder: MediaCodec? = null
     private var inputSurface: Surface? = null
     private var drainThread: Thread? = null
-    @Volatile private var running = false
     @Volatile private var encoderFormat: MediaFormat? = null
+
+    // Audio
+    private var audioRecord: AudioRecord? = null
+    private var audioEncoder: MediaCodec? = null
+    private var audioPumpThread: Thread? = null
+    private var audioDrainThread: Thread? = null
+    @Volatile private var audioFormat: MediaFormat? = null
+    private val audioSampleRate = 44_100
+    private val audioChannels = 1
+    private val audioBitrate = 64_000
+
+    @Volatile private var running = false
 
     fun getInputSurface(): Surface? = inputSurface
 
     fun start() {
         if (running) return
+        running = true
+        startVideo()
+        startAudio()
+    }
+
+    fun stop() {
+        if (!running) return
+        running = false
+        drainThread?.join(1000)
+        audioPumpThread?.join(1000)
+        audioDrainThread?.join(1000)
+        try { encoder?.stop() } catch (_: Throwable) {}
+        try { encoder?.release() } catch (_: Throwable) {}
+        try { inputSurface?.release() } catch (_: Throwable) {}
+        try { audioEncoder?.stop() } catch (_: Throwable) {}
+        try { audioEncoder?.release() } catch (_: Throwable) {}
+        try { audioRecord?.stop() } catch (_: Throwable) {}
+        try { audioRecord?.release() } catch (_: Throwable) {}
+        encoder = null
+        inputSurface = null
+        drainThread = null
+        audioRecord = null
+        audioEncoder = null
+        audioPumpThread = null
+        audioDrainThread = null
+        ringBuffer.clear()
+        audioBuffer.clear()
+        encoderFormat = null
+        audioFormat = null
+    }
+
+    // ---- video ----
+
+    private fun startVideo() {
         val format = MediaFormat.createVideoFormat(
             MediaFormat.MIMETYPE_VIDEO_AVC, width, height
         ).apply {
@@ -58,26 +114,11 @@ class ShotRecorder(
             inputSurface = createInputSurface()
             start()
         }
-        running = true
-        drainThread = Thread({ drainLoop() }, "ShotRecorder-drain").also { it.start() }
-        onEvent("encoder started ${width}x${height}@${fps} ${bitrate / 1_000_000} Mbps", false)
+        drainThread = Thread({ drainVideo() }, "ShotRecorder-video-drain").also { it.start() }
+        onEvent("video encoder started ${width}x${height}@${fps} ${bitrate / 1_000_000} Mbps", false)
     }
 
-    fun stop() {
-        if (!running) return
-        running = false
-        drainThread?.join(1000)
-        try { encoder?.stop() } catch (_: Throwable) {}
-        try { encoder?.release() } catch (_: Throwable) {}
-        try { inputSurface?.release() } catch (_: Throwable) {}
-        encoder = null
-        inputSurface = null
-        drainThread = null
-        ringBuffer.clear()
-        encoderFormat = null
-    }
-
-    private fun drainLoop() {
+    private fun drainVideo() {
         val enc = encoder ?: return
         val info = MediaCodec.BufferInfo()
         while (running) {
@@ -87,7 +128,7 @@ class ShotRecorder(
             when {
                 idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                     encoderFormat = enc.outputFormat
-                    onEvent("encoder format ready", false)
+                    onEvent("video encoder format ready", false)
                 }
                 idx == MediaCodec.INFO_TRY_AGAIN_LATER -> { /* poll again */ }
                 idx >= 0 -> {
@@ -104,7 +145,7 @@ class ShotRecorder(
                     val isKey = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
                     if (!isConfig) {
                         ringBuffer.add(Nal(bytes, info.presentationTimeUs, isKey, false))
-                        trimBuffer()
+                        trimRing(ringBuffer) { it.ptsUs }
                     }
                     enc.releaseOutputBuffer(idx, false)
                     if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
@@ -113,60 +154,199 @@ class ShotRecorder(
         }
     }
 
-    private fun trimBuffer() {
-        val newest = ringBuffer.peekLast()?.ptsUs ?: return
-        while (true) {
-            val oldest = ringBuffer.peekFirst() ?: break
-            if (newest - oldest.ptsUs > bufferMaxUs) {
-                ringBuffer.pollFirst()
-            } else {
-                break
+    // ---- audio ----
+
+    private fun startAudio() {
+        try {
+            val channelCfg = AudioFormat.CHANNEL_IN_MONO
+            val fmt = AudioFormat.ENCODING_PCM_16BIT
+            val minBuf = AudioRecord.getMinBufferSize(audioSampleRate, channelCfg, fmt)
+            if (minBuf <= 0) throw IllegalStateException("getMinBufferSize=$minBuf")
+            val bufBytes = minBuf.coerceAtLeast(8192) * 2
+            @Suppress("MissingPermission")
+            audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                audioSampleRate,
+                channelCfg,
+                fmt,
+                bufBytes,
+            )
+            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                throw IllegalStateException("AudioRecord not initialized (state=${audioRecord?.state})")
+            }
+            val mediaFmt = MediaFormat.createAudioFormat(
+                MediaFormat.MIMETYPE_AUDIO_AAC, audioSampleRate, audioChannels,
+            ).apply {
+                setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+                setInteger(MediaFormat.KEY_BIT_RATE, audioBitrate)
+                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, bufBytes)
+            }
+            audioEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).apply {
+                configure(mediaFmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                start()
+            }
+            audioRecord?.startRecording()
+            audioPumpThread = Thread({ pumpAudio() }, "ShotRecorder-audio-pump").also { it.start() }
+            audioDrainThread = Thread({ drainAudio() }, "ShotRecorder-audio-drain").also { it.start() }
+            onEvent("audio encoder started ${audioSampleRate} Hz mono AAC ${audioBitrate / 1000} kbps", false)
+        } catch (t: Throwable) {
+            onEvent("audio disabled: ${t.message}", true)
+            try { audioEncoder?.release() } catch (_: Throwable) {}
+            try { audioRecord?.release() } catch (_: Throwable) {}
+            audioEncoder = null
+            audioRecord = null
+        }
+    }
+
+    private fun pumpAudio() {
+        val ar = audioRecord ?: return
+        val enc = audioEncoder ?: return
+        val startUs = SystemClock.elapsedRealtimeNanos() / 1000L
+        var framesRead = 0L
+        val pcm = ByteArray(4096)
+        val bytesPerFrame = 2 * audioChannels // PCM_16BIT = 2 bytes
+        while (running) {
+            val read = try { ar.read(pcm, 0, pcm.size) } catch (_: Throwable) { -1 }
+            if (read <= 0) continue
+            val idx = try { enc.dequeueInputBuffer(10_000) } catch (_: Throwable) { continue }
+            if (idx < 0) continue
+            val inBuf = try { enc.getInputBuffer(idx) } catch (_: Throwable) { null } ?: continue
+            inBuf.clear()
+            inBuf.put(pcm, 0, read)
+            // PTS of this buffer = start + frames-so-far / sampleRate.
+            val ptsUs = startUs + (framesRead * 1_000_000L / audioSampleRate)
+            try {
+                enc.queueInputBuffer(idx, 0, read, ptsUs, 0)
+            } catch (_: Throwable) { break }
+            framesRead += (read / bytesPerFrame)
+        }
+        // Signal EOS to the audio encoder.
+        try {
+            val idx = enc.dequeueInputBuffer(10_000)
+            if (idx >= 0) enc.queueInputBuffer(idx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+        } catch (_: Throwable) {}
+    }
+
+    private fun drainAudio() {
+        val enc = audioEncoder ?: return
+        val info = MediaCodec.BufferInfo()
+        while (running) {
+            val idx = try { enc.dequeueOutputBuffer(info, 10_000) } catch (_: Throwable) { break }
+            when {
+                idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                    audioFormat = enc.outputFormat
+                    onEvent("audio encoder format ready", false)
+                }
+                idx == MediaCodec.INFO_TRY_AGAIN_LATER -> { /* poll again */ }
+                idx >= 0 -> {
+                    val buf = try { enc.getOutputBuffer(idx) } catch (_: Throwable) { null }
+                    if (buf == null) {
+                        try { enc.releaseOutputBuffer(idx, false) } catch (_: Throwable) {}
+                        continue
+                    }
+                    val isConfig = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                    if (!isConfig && info.size > 0) {
+                        buf.position(info.offset)
+                        buf.limit(info.offset + info.size)
+                        val bytes = ByteArray(info.size)
+                        buf.get(bytes)
+                        audioBuffer.add(AudioSample(bytes, info.presentationTimeUs))
+                        trimRing(audioBuffer) { it.ptsUs }
+                    }
+                    try { enc.releaseOutputBuffer(idx, false) } catch (_: Throwable) {}
+                    if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
+                }
             }
         }
     }
 
+    // ---- ring management ----
+
+    private inline fun <T> trimRing(buf: ConcurrentLinkedDeque<T>, getPts: (T) -> Long) {
+        val newest = getPts(buf.peekLast() ?: return)
+        while (true) {
+            val oldest = buf.peekFirst() ?: break
+            if (newest - getPts(oldest) > bufferMaxUs) buf.pollFirst() else break
+        }
+    }
+
+    // ---- muxing ----
+
     fun sliceLastSeconds(seconds: Double): ByteArray? {
-        val format = encoderFormat ?: run {
-            onEvent("slice: encoder format not ready yet", true)
+        val vFormat = encoderFormat ?: run {
+            onEvent("slice: video encoder format not ready yet", true)
             return null
         }
-        val frames = ringBuffer.toList()
-        if (frames.isEmpty()) {
+        val videoFrames = ringBuffer.toList()
+        if (videoFrames.isEmpty()) {
             onEvent("slice: ring buffer empty", true)
             return null
         }
-        val newest = frames.last().ptsUs
+        val newest = videoFrames.last().ptsUs
         val cutStart = newest - (seconds * 1_000_000).toLong()
-        val startIdx = frames.indexOfFirst { it.isKey && it.ptsUs >= cutStart }
+        val startIdx = videoFrames.indexOfFirst { it.isKey && it.ptsUs >= cutStart }
         if (startIdx < 0) {
             onEvent("slice: no key frame in window (buffer too short?)", true)
             return null
         }
-        val slice = frames.subList(startIdx, frames.size)
-        val basePts = slice.first().ptsUs
+        val videoSlice = videoFrames.subList(startIdx, videoFrames.size)
+        val basePts = videoSlice.first().ptsUs
+        val durationUs = newest - basePts
+
+        // Audio pts uses a different clock (SystemClock.elapsedRealtimeNanos)
+        // than video pts (Camera2 sensor timebase) — we can't compare them
+        // directly. Instead, take the last `durationUs` of audio ending at the
+        // most recent audio sample. Both tracks end "now" in real time, so
+        // the tails line up within a few ms regardless of clock offset.
+        val aFormat = audioFormat
+        val (audioSlice, audioBasePts) = if (aFormat != null) {
+            val audioAll = audioBuffer.toList()
+            val audioNewest = audioAll.lastOrNull()?.ptsUs
+            if (audioNewest == null) {
+                emptyList<AudioSample>() to 0L
+            } else {
+                val audioStart = audioNewest - durationUs
+                audioAll.filter { it.ptsUs >= audioStart } to audioStart
+            }
+        } else emptyList<AudioSample>() to 0L
 
         val out = File(cacheDir, "shot-${System.currentTimeMillis()}.mp4")
         return try {
             val muxer = MediaMuxer(out.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            val track = muxer.addTrack(format)
+            val videoTrack = muxer.addTrack(vFormat)
+            val audioTrack = if (aFormat != null) muxer.addTrack(aFormat) else -1
             muxer.start()
-            val maxSize = slice.maxOf { it.bytes.size }
-            val bb = ByteBuffer.allocate(maxSize)
-            val bufInfo = MediaCodec.BufferInfo()
-            for (nal in slice) {
-                bb.clear()
-                bb.put(nal.bytes)
-                bb.flip()
-                bufInfo.offset = 0
-                bufInfo.size = nal.bytes.size
-                bufInfo.presentationTimeUs = nal.ptsUs - basePts
-                bufInfo.flags = if (nal.isKey) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
-                muxer.writeSampleData(track, bb, bufInfo)
+
+            val maxVideo = videoSlice.maxOf { it.bytes.size }
+            val bbV = ByteBuffer.allocate(maxVideo)
+            val info = MediaCodec.BufferInfo()
+            for (nal in videoSlice) {
+                bbV.clear(); bbV.put(nal.bytes); bbV.flip()
+                info.offset = 0
+                info.size = nal.bytes.size
+                info.presentationTimeUs = nal.ptsUs - basePts
+                info.flags = if (nal.isKey) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
+                muxer.writeSampleData(videoTrack, bbV, info)
+            }
+            if (audioTrack >= 0 && audioSlice.isNotEmpty()) {
+                val maxAudio = audioSlice.maxOf { it.bytes.size }
+                val bbA = ByteBuffer.allocate(maxAudio)
+                for (s in audioSlice) {
+                    bbA.clear(); bbA.put(s.bytes); bbA.flip()
+                    info.offset = 0
+                    info.size = s.bytes.size
+                    info.presentationTimeUs = s.ptsUs - audioBasePts
+                    info.flags = 0
+                    muxer.writeSampleData(audioTrack, bbA, info)
+                }
             }
             muxer.stop()
             muxer.release()
             val bytes = out.readBytes()
-            onEvent("slice: ${slice.size} frames, ${bytes.size / 1024} KB", false)
+            onEvent(
+                "slice: ${videoSlice.size} v / ${audioSlice.size} a, ${bytes.size / 1024} KB",
+                false,
+            )
             bytes
         } catch (e: Throwable) {
             onEvent("mux error: ${e.message}", true)
