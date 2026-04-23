@@ -737,7 +737,7 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
         import cv2
         import time
         from arrowlab.video.live_sim import auto_detect_flight_in_clip
-        from arrowlab.video.track import build_roi_mask, track_clip
+        from arrowlab.video.track import build_roi_mask, probe_fps, track_clip
 
         t_start = time.perf_counter()
         cap = cv2.VideoCapture(str(slice_path))
@@ -752,13 +752,38 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
         if not frames:
             return None
         h, w = frames[0].shape[:2]
-        roi = build_roi_mask((h, w), annotation)
-        detected = auto_detect_flight_in_clip(frames, roi)
+
+        # Audio onset detection: if we can pull release + impact from the
+        # audio track, use those as the authoritative flight window. The
+        # old motion-based detector only runs as a fallback when audio
+        # didn't give us both timestamps (silent track, weak transients).
+        audio_events = _detect_audio_events(slice_path)
+        t_audio = time.perf_counter()
+
+        fps_probe = probe_fps(slice_path)
+        a: int | None = None
+        b: int | None = None
+        flight_source = "none"
+        if (
+            audio_events.get("release_s") is not None
+            and audio_events.get("impact_s") is not None
+        ):
+            a_guess = int(round(audio_events["release_s"] * fps_probe))
+            b_guess = int(round(audio_events["impact_s"] * fps_probe))
+            # 2-frame pad each side covers audio/video alignment jitter.
+            a = max(0, a_guess - 2)
+            b = min(len(frames) - 1, b_guess + 2)
+            if b > a:
+                flight_source = "audio"
+        if flight_source == "none":
+            roi = build_roi_mask((h, w), annotation)
+            detected = auto_detect_flight_in_clip(frames, roi)
+            if detected is None:
+                print(f"[shot {n}] decode={t_decoded-t_start:.1f}s audio={t_audio-t_decoded:.1f}s (NO FLIGHT)")
+                return None
+            a, b = detected
+            flight_source = "motion"
         t_detected = time.perf_counter()
-        if detected is None:
-            print(f"[shot {n}] decode={t_decoded-t_start:.1f}s detect={t_detected-t_decoded:.1f}s (NO FLIGHT)")
-            return None
-        a, b = detected
         traj_path = track_clip(
             slice_path, annotation, a + 1, b + 1,
             clip_start_frame=1, clip_end_frame=len(frames),
@@ -771,10 +796,16 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
         t_tracked = time.perf_counter()
         timings_s = {
             "decode_s": round(t_decoded - t_start, 3),
-            "detect_s": round(t_detected - t_decoded, 3),
+            "audio_detect_s": round(t_audio - t_decoded, 3),
+            "detect_s": round(t_detected - t_audio, 3),
             "track_s": round(t_tracked - t_detected, 3),
         }
-        print(f"[shot {n}] decode={timings_s['decode_s']}s detect={timings_s['detect_s']}s track={timings_s['track_s']}s frames={len(frames)}")
+        print(
+            f"[shot {n}] decode={timings_s['decode_s']}s "
+            f"audio={timings_s['audio_detect_s']}s "
+            f"flight({flight_source})={timings_s['detect_s']}s "
+            f"track={timings_s['track_s']}s frames={len(frames)}"
+        )
         session["trajectories"].append(traj_path)
         with open(traj_path) as f:
             trajectory = yaml.safe_load(f)
@@ -817,17 +848,14 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
         t_trimmed = time.perf_counter()
         timings_s["trim_s"] = round(t_trimmed - t_tracked, 3)
 
-        # Audio onset detection: pull release + impact timestamps out of the
-        # source mp4's audio track. `speed_audio_ms` is the chronograph
-        # derivation — independent of the visual tracker, so it's a cross-
-        # check on the pixel-based speed metric.
-        audio_events = _detect_audio_events(slice_path)
+        # Audio chronograph: reuse the events already detected up-front for
+        # flight-window picking. Speed is computed with sound-propagation
+        # correction based on the session range geometry.
         speed_audio_ms = _audio_chronograph_speed_ms(
             audio_events.get("release_s"),
             audio_events.get("impact_s"),
             session.get("range"),
         )
-        timings_s["audio_s"] = round(time.perf_counter() - t_trimmed, 3)
         clip_url = "/videos/" + clip_trim.relative_to(DATA_RAW).as_posix()
         tracked_url = "/processed/" + tracked_path.relative_to(DATA_PROCESSED).as_posix()
         start_s = 0.0
