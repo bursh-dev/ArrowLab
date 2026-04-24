@@ -43,25 +43,6 @@ def view_page() -> str:
     return (STATIC_DIR / "view.html").read_text(encoding="utf-8")
 
 
-@app.get("/api/view")
-def view_data(video: str) -> dict:
-    stem = Path(video).stem
-    shot_clips = sorted((DATA_PROCESSED / "shot_clips").glob(f"{stem}_shot*.mp4")) if (DATA_PROCESSED / "shot_clips").exists() else []
-    tracked = sorted((DATA_PROCESSED / "tracked").glob(f"{stem}_shot*_tracked.mp4")) if (DATA_PROCESSED / "tracked").exists() else []
-    synth = sorted((DATA_PROCESSED / "synth").glob(f"{stem}_shot*_synth.mp4")) if (DATA_PROCESSED / "synth").exists() else []
-    combined = DATA_PROCESSED / "synth" / f"{stem}_combined.mp4"
-
-    def rel(p: Path) -> str:
-        return "/processed/" + p.relative_to(DATA_PROCESSED).as_posix()
-
-    return {
-        "shot_clips": [rel(p) for p in shot_clips],
-        "tracked": [rel(p) for p in tracked],
-        "synth": [rel(p) for p in synth],
-        "combined": rel(combined) if combined.exists() else None,
-    }
-
-
 @app.get("/api/videos")
 def list_videos() -> list[str]:
     videos: list[str] = []
@@ -207,6 +188,18 @@ def _load_persisted_session() -> None:
     # Recover shots from on-disk trajectories if persisted list is empty
     if not s["shots"]:
         s["shots"] = _recover_shots_for_stem(s["stem"])
+    # Backfill target_photo_url for persisted shots that predate the feature
+    # (or were recovered before the photo existed on disk).
+    stem = s["stem"]
+    for sh in s["shots"]:
+        if sh.get("target_photo_url"):
+            continue
+        n = int(sh.get("shot") or 0)
+        if not n:
+            continue
+        photo = DATA_RAW / "sessions" / f"{stem}_shot{n:02d}_target.jpg"
+        if photo.exists():
+            sh["target_photo_url"] = "/videos/" + photo.relative_to(DATA_RAW).as_posix()
     LIVE_STATE["session"] = s
 
 
@@ -231,28 +224,17 @@ def _recover_shots_for_stem(stem: str) -> list[dict]:
         except Exception:
             continue
         fps = float(trajectory.get("fps") or 240.0)
-        fw = trajectory.get("flight_window") or [1, 1]
-        tfirst = trajectory.get("tracked_first_frame")
+        tfirst = int(trajectory.get("tracked_first_frame") or 1)
+        trim_offset_s = max(0.0, (tfirst - 1) / fps)
         clip_trim = clip_mp4.with_name(clip_mp4.stem + "_trim.mp4")
-        tracked_trim = tracked_mp4.with_name(tracked_mp4.stem + "_trim.mp4")
-
-        if tfirst is not None:
-            # New tracker: tracked_mp4 is already trimmed to its own frame window.
-            trim_offset_s = max(0.0, (int(tfirst) - 1) / fps)
-            out_tracked = tracked_mp4
-            out_clip = clip_trim if clip_trim.exists() else clip_mp4
-            start_s = 0.0 if clip_trim.exists() else trim_offset_s
-        elif clip_trim.exists() and tracked_trim.exists():
-            # Legacy sibling-trim shots
-            trim_offset_s = max(0.0, (fw[0] - 1) / fps - 0.2)
-            out_clip = clip_trim
-            out_tracked = tracked_trim
-            start_s = 0.0
-        else:
-            trim_offset_s = 0.0
-            out_clip = clip_mp4
-            out_tracked = tracked_mp4
-            start_s = max(0.0, (fw[0] - 1) / fps - 0.2)
+        out_clip = clip_trim if clip_trim.exists() else clip_mp4
+        out_tracked = tracked_mp4
+        start_s = 0.0 if clip_trim.exists() else trim_offset_s
+        photo_path = clip_mp4.with_name(clip_mp4.stem + "_target.jpg")
+        target_photo_url = (
+            "/videos/" + photo_path.relative_to(DATA_RAW).as_posix()
+            if photo_path.exists() else None
+        )
         recovered.append({
             "type": "shot_ready",
             "shot": n,
@@ -261,6 +243,7 @@ def _recover_shots_for_stem(stem: str) -> list[dict]:
             "trajectory": trajectory,
             "start_s": start_s,
             "trim_offset_s": trim_offset_s,
+            "target_photo_url": target_photo_url,
         })
     return recovered
 
@@ -405,11 +388,11 @@ async def api_session_delete_shot(n: int) -> dict:
     removed = len(shots) - len(keep)
     s["shots"] = keep
     stem = s["stem"]
-    # Best-effort file cleanup (raw, trimmed raw, tracked, trimmed tracked, trajectory)
+    # Best-effort file cleanup (raw, trimmed raw, tracked, trajectory)
     (DATA_RAW / "sessions" / f"{stem}_shot{n:02d}.mp4").unlink(missing_ok=True)
     (DATA_RAW / "sessions" / f"{stem}_shot{n:02d}_trim.mp4").unlink(missing_ok=True)
+    (DATA_RAW / "sessions" / f"{stem}_shot{n:02d}_target.jpg").unlink(missing_ok=True)
     (DATA_PROCESSED / "tracked" / f"{stem}_shot{n:02d}_tracked.mp4").unlink(missing_ok=True)
-    (DATA_PROCESSED / "tracked" / f"{stem}_shot{n:02d}_tracked_trim.mp4").unlink(missing_ok=True)
     (DATA_PROCESSED / "trajectories" / f"{stem}_shot{n:02d}.yaml").unlink(missing_ok=True)
     _persist_session()
     await _broadcast_view({"type": "state", **_session_snapshot()})
@@ -555,6 +538,38 @@ def _audio_chronograph_speed_ms(release_s: float | None, impact_s: float | None,
     return float(D / gap_corrected)
 
 
+def _extract_target_photo(
+    mp4_path: Path,
+    at_s: float,
+    bbox: list[int] | None,
+    out_jpeg: Path,
+    margin_px: int = 40,
+) -> bool:
+    """Extract a single frame from `mp4_path` at `at_s`, crop to the target
+    region defined by `bbox` + margin, save as JPEG. Returns True on success.
+    If `bbox` is None, saves the full frame."""
+    out_jpeg.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error", "-nostdin",
+        "-ss", f"{max(0.0, at_s):.3f}",
+        "-i", str(mp4_path),
+        "-frames:v", "1",
+    ]
+    if bbox is not None and len(bbox) == 4:
+        x0, y0, x1, y1 = bbox
+        cx = max(0, x0 - margin_px)
+        cy = max(0, y0 - margin_px)
+        cw = (x1 - x0) + 2 * margin_px
+        ch = (y1 - y0) + 2 * margin_px
+        cmd += ["-vf", f"crop={cw}:{ch}:{cx}:{cy}"]
+    cmd += ["-q:v", "2", str(out_jpeg)]
+    try:
+        subprocess.run(cmd, check=True)
+        return out_jpeg.exists() and out_jpeg.stat().st_size > 0
+    except subprocess.CalledProcessError:
+        return False
+
+
 def _merge_audio_from_source(src_mp4: Path, video_only_mp4: Path, start_s: float, dur_s: float) -> None:
     """Add an audio track to `video_only_mp4` by copying `dur_s` of audio from
     `src_mp4` starting at `start_s`. Overwrites `video_only_mp4` with the
@@ -695,6 +710,18 @@ async def ws_view(ws: WebSocket) -> None:
                     await ws.send_json({"type": "error", "msg": "session not calibrated"})
                     continue
                 await phone.send_json({"type": "slice", "duration": 6})
+            elif kind in ("arm", "disarm"):
+                phone = LIVE_STATE["phone_ws"]
+                if phone is None:
+                    await ws.send_json({"type": "error", "msg": "no phone connected"})
+                    continue
+                if kind == "arm":
+                    s = LIVE_STATE["session"]
+                    if s is None or s["annotation"] is None:
+                        await ws.send_json({"type": "error", "msg": "session not calibrated"})
+                        continue
+                await phone.send_json({"type": kind})
+                await _broadcast_view({"type": f"{kind}ed"})
     except WebSocketDisconnect:
         if ws in LIVE_STATE["view_wss"]:
             LIVE_STATE["view_wss"].remove(ws)
@@ -714,6 +741,21 @@ async def api_shot(request: Request) -> dict:
     slice_path.parent.mkdir(parents=True, exist_ok=True)
     slice_path.write_bytes(data)
     _persist_session()
+    # Phone-provided audio event timestamps (armed mode) override server-side
+    # detection. Seconds are measured from the start of this mp4.
+    def _float_header(name: str) -> float | None:
+        v = request.headers.get(name)
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except ValueError:
+            return None
+    provided_events = {
+        "release_s": _float_header("X-Arrow-Release-S"),
+        "impact_s": _float_header("X-Arrow-Impact-S"),
+    } if request.headers.get("X-Arrow-Release-S") or request.headers.get("X-Arrow-Impact-S") else None
+
     clip_url = "/videos/" + slice_path.relative_to(DATA_RAW).as_posix()
     await _broadcast_view({
         "type": "shot_uploaded",
@@ -721,11 +763,16 @@ async def api_shot(request: Request) -> dict:
         "bytes": len(data),
         "clip_url": clip_url,
     })
-    asyncio.create_task(_process_shot(slice_path, n, s))
+    asyncio.create_task(_process_shot(slice_path, n, s, provided_events=provided_events))
     return {"ok": True, "shot_id": n, "clip_url": clip_url}
 
 
-async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
+async def _process_shot(
+    slice_path: Path,
+    n: int,
+    session: dict,
+    provided_events: dict | None = None,
+) -> None:
     import time as _time
     t_pipeline_start = _time.perf_counter()
     annotation = session["annotation"]
@@ -753,11 +800,16 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
             return None
         h, w = frames[0].shape[:2]
 
-        # Audio onset detection: if we can pull release + impact from the
-        # audio track, use those as the authoritative flight window. The
-        # old motion-based detector only runs as a fallback when audio
-        # didn't give us both timestamps (silent track, weak transients).
-        audio_events = _detect_audio_events(slice_path)
+        # Audio onset detection. If the phone already ran its own detector
+        # (armed mode) and sent timestamps, trust those and skip the server
+        # pass entirely. Otherwise run the server detector.
+        if provided_events and provided_events.get("release_s") is not None and provided_events.get("impact_s") is not None:
+            audio_events = {
+                "release_s": float(provided_events["release_s"]),
+                "impact_s": float(provided_events["impact_s"]),
+            }
+        else:
+            audio_events = _detect_audio_events(slice_path)
         t_audio = time.perf_counter()
 
         fps_probe = probe_fps(slice_path)
@@ -860,6 +912,17 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
         tracked_url = "/processed/" + tracked_path.relative_to(DATA_PROCESSED).as_posix()
         start_s = 0.0
 
+        # Target photo: grab a frame ~300 ms after impact (arrow already
+        # embedded, vibration mostly settled) and crop to the annotated
+        # target bbox. Cheap path — no phone-side still capture needed.
+        target_photo_url: str | None = None
+        impact_s = audio_events.get("impact_s")
+        bbox = (annotation.get("target") or {}).get("bbox") if annotation else None
+        photo_at_s = (impact_s if impact_s is not None else (tlast - 1) / fps) + 0.3
+        photo_path = DATA_RAW / "sessions" / f"{slice_path.stem}_target.jpg"
+        if _extract_target_photo(slice_path, photo_at_s, bbox, photo_path):
+            target_photo_url = "/videos/" + photo_path.relative_to(DATA_RAW).as_posix()
+
         return {
             "tracked_url": tracked_url,
             "clip_url": clip_url,
@@ -870,6 +933,7 @@ async def _process_shot(slice_path: Path, n: int, session: dict) -> None:
             "audio_release_s": audio_events.get("release_s"),
             "audio_impact_s": audio_events.get("impact_s"),
             "speed_audio_ms": speed_audio_ms,
+            "target_photo_url": target_photo_url,
         }
 
     try:

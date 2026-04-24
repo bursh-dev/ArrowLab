@@ -60,6 +60,39 @@ class ShotRecorder(
 
     @Volatile private var running = false
 
+    // Armed-continuous mode: feeds the onset detector with live PCM and calls
+    // back when a release -> impact pair is seen.
+    private val onsetDetector = OnsetDetector(audioSampleRate)
+    @Volatile private var armedCallback: ((bytes: ByteArray, releasePtsUs: Long, impactPtsUs: Long, videoDurationS: Double) -> Unit)? = null
+    private val triggerPool = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "ShotRecorder-trigger").also { it.isDaemon = true }
+    }
+
+    fun arm(onShot: (bytes: ByteArray, releasePtsUs: Long, impactPtsUs: Long, videoDurationS: Double) -> Unit) {
+        armedCallback = onShot
+        onsetDetector.arm { releasePts, impactPts ->
+            val postPadMs = 220L
+            triggerPool.execute {
+                try {
+                    Thread.sleep(postPadMs)
+                } catch (_: InterruptedException) {}
+                // Minimum 1.5 s so the slice always contains a video keyframe
+                // (encoder emits one every 1 s).
+                val gapS = (impactPts - releasePts) / 1_000_000.0
+                val durationS = (gapS + 0.4).coerceAtLeast(1.5)
+                val result = sliceLastSeconds(durationS)
+                if (result != null) armedCallback?.invoke(result.bytes, releasePts, impactPts, result.videoDurationS)
+            }
+        }
+        onEvent("armed: listening for release->impact", false)
+    }
+
+    fun disarm() {
+        onsetDetector.disarm()
+        armedCallback = null
+        onEvent("disarmed", false)
+    }
+
     fun getInputSurface(): Surface? = inputSurface
 
     fun start() {
@@ -72,6 +105,8 @@ class ShotRecorder(
     fun stop() {
         if (!running) return
         running = false
+        disarm()
+        triggerPool.shutdown()
         drainThread?.join(1000)
         audioPumpThread?.join(1000)
         audioDrainThread?.join(1000)
@@ -218,6 +253,8 @@ class ShotRecorder(
             try {
                 enc.queueInputBuffer(idx, 0, read, ptsUs, 0)
             } catch (_: Throwable) { break }
+            // Feed the live detector with this PCM chunk (no-op when disarmed).
+            onsetDetector.process(pcm, read, ptsUs)
             framesRead += (read / bytesPerFrame)
         }
         // Signal EOS to the audio encoder.
@@ -272,7 +309,11 @@ class ShotRecorder(
 
     // ---- muxing ----
 
-    fun sliceLastSeconds(seconds: Double): ByteArray? {
+    /** Result of a slice: the muxed mp4 bytes plus the actual video-track
+     *  duration in seconds (what the browser will report). */
+    data class SliceResult(val bytes: ByteArray, val videoDurationS: Double)
+
+    fun sliceLastSeconds(seconds: Double): SliceResult? {
         val vFormat = encoderFormat ?: run {
             onEvent("slice: video encoder format not ready yet", true)
             return null
@@ -293,11 +334,12 @@ class ShotRecorder(
         val basePts = videoSlice.first().ptsUs
         val durationUs = newest - basePts
 
-        // Audio pts uses a different clock (SystemClock.elapsedRealtimeNanos)
-        // than video pts (Camera2 sensor timebase) — we can't compare them
-        // directly. Instead, take the last `durationUs` of audio ending at the
-        // most recent audio sample. Both tracks end "now" in real time, so
-        // the tails line up within a few ms regardless of clock offset.
+        // Audio: take the LAST `durationUs` of audio (same duration as the
+        // video slice, not the requested slice duration). Both tracks in
+        // the output end at "now" in real time, so aligning by matching
+        // duration keeps them synchronized end-to-end — the two clocks
+        // (video = sensor timebase, audio = SystemClock) don't need to
+        // share a common zero.
         val aFormat = audioFormat
         val (audioSlice, audioBasePts) = if (aFormat != null) {
             val audioAll = audioBuffer.toList()
@@ -343,11 +385,12 @@ class ShotRecorder(
             muxer.stop()
             muxer.release()
             val bytes = out.readBytes()
+            val videoDurationS = durationUs / 1_000_000.0
             onEvent(
-                "slice: ${videoSlice.size} v / ${audioSlice.size} a, ${bytes.size / 1024} KB",
+                "slice: ${videoSlice.size} v / ${audioSlice.size} a, ${bytes.size / 1024} KB, dur=%.3fs".format(videoDurationS),
                 false,
             )
-            bytes
+            SliceResult(bytes, videoDurationS)
         } catch (e: Throwable) {
             onEvent("mux error: ${e.message}", true)
             null

@@ -399,6 +399,30 @@ class MainActivity : AppCompatActivity() {
                     }
                 } ?: appendLog("camera not ready for slice", error = true)
             }
+            "arm" -> {
+                val ok = cameraController?.arm { bytes, releasePtsUs, impactPtsUs, videoDurationS ->
+                    // Audio is synced to the video's actual duration in the
+                    // mp4 (both tracks end at "now"), and the trigger pool
+                    // sleeps `postPadS` after impact before cutting. So:
+                    //   impact in mp4  = videoDuration - postPad
+                    //   release in mp4 = impact - gap
+                    val gapS = (impactPtsUs - releasePtsUs) / 1_000_000.0
+                    val postPadS = 0.22
+                    val impactInMp4S = videoDurationS - postPadS
+                    val releaseInMp4S = impactInMp4S - gapS
+                    runOnUiThread {
+                        appendLog(
+                            "armed-shot: ${bytes.size / 1024} KB gap=${(gapS * 1000).toInt()} ms dur=${"%.2f".format(videoDurationS)}s, uploading...",
+                            ok = true,
+                        )
+                    }
+                    uploadShot(bytes, releaseS = releaseInMp4S, impactS = impactInMp4S)
+                } == true
+                if (!ok) appendLog("arm failed — camera not ready", error = true)
+            }
+            "disarm" -> {
+                cameraController?.disarm()
+            }
         }
     }
 
@@ -426,16 +450,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun uploadShot(bytes: ByteArray) {
+    private fun uploadShot(bytes: ByteArray, releaseS: Double? = null, impactS: Double? = null) {
         val host = currentHost ?: return
         scope.launch(Dispatchers.IO) {
             try {
                 val body = bytes.toRequestBody("video/mp4".toMediaType())
-                val req = Request.Builder()
+                val builder = Request.Builder()
                     .url("http://$host:$SERVER_PORT/api/shot")
                     .post(body)
-                    .build()
-                http.newCall(req).execute().use { resp ->
+                if (releaseS != null) builder.addHeader("X-Arrow-Release-S", "%.6f".format(releaseS))
+                if (impactS != null) builder.addHeader("X-Arrow-Impact-S", "%.6f".format(impactS))
+                http.newCall(builder.build()).execute().use { resp ->
                     runOnUiThread {
                         if (resp.isSuccessful) {
                             appendLog("shot uploaded", ok = true)

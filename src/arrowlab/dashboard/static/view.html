@@ -9,27 +9,33 @@
 </head>
 <body>
   <header class="view-header">
-    <h1>ArrowLab</h1>
-    <nav class="controls">
-      <a href="/">← Annotate</a>
-      <span id="status"></span>
-    </nav>
+    <h1 class="view-title">ArrowLab</h1>
+    <div class="status-bulbs" id="statusBulbs">
+      <span class="bulb bad" id="bulbPhone" title="phone: none"></span>
+      <span class="bulb bad" id="bulbSession" title="session: none"></span>
+      <span class="bulb bad" id="bulbRange" title="range: no"></span>
+      <span class="bulb bad" id="bulbCalib" title="calibrated: no"></span>
+      <span class="bulb shot-count-bulb" id="bulbShotCount" title="0 shots">0</span>
+    </div>
+    <span id="status" class="view-status"></span>
   </header>
 
   <main class="view-main">
-    <div class="status-bar">
-      <span>Phone: <span id="phoneStatus" class="pill bad">none</span></span>
-      <span>Session: <span id="sessionStatus" class="pill bad">none</span></span>
-      <span>Range: <span id="rangeStatus" class="pill bad">no</span></span>
-      <span>Calibrated: <span id="calibStatus" class="pill bad">no</span></span>
-      <span id="shotCount" class="shot-count">0 shots</span>
-    </div>
 
     <nav class="tabs" id="tabs">
       <button data-tab="session" class="active">Session</button>
       <button data-tab="range">Range</button>
       <button data-tab="calibrate">Calibrate</button>
       <button data-tab="shoot">Shoot</button>
+      <div id="shootTabActions" class="tab-actions hidden">
+        <button id="shotBtn" class="shot-btn" disabled>SHOT!</button>
+        <button id="playAllBtn" disabled>▶ Play</button>
+        <button id="pauseAllBtn" disabled>⏸ Pause</button>
+        <label class="shoot-toggle">
+          <input type="checkbox" id="showAllShots" checked />
+          show all shots
+        </label>
+      </div>
     </nav>
 
     <!-- SESSION TAB -->
@@ -109,17 +115,6 @@
 
     <!-- SHOOT TAB -->
     <section class="tab-panel" data-tab="shoot">
-      <div class="shoot-actions">
-        <button id="shotBtn" class="shot-btn" disabled>SHOT!</button>
-        <button id="playAllBtn" disabled>▶ Play</button>
-        <button id="pauseAllBtn" disabled>⏸ Pause</button>
-        <label class="shoot-toggle">
-          <input type="checkbox" id="showAllShots" checked />
-          show all shots
-        </label>
-        <span class="shoot-hint">calibration required before shooting</span>
-      </div>
-
       <div id="shotHistory" class="shot-history hidden">
         <div class="shot-history-head">
           <span>Shots:</span>
@@ -137,43 +132,67 @@
             <video id="lastShotTracked" controls muted preload="metadata"></video>
             <figcaption>tracked</figcaption>
           </figure>
-          <div class="shot-stats">
-            <div class="stats-block">
-              <h4>Shot #<span id="statsShotNum">?</span></h4>
-              <dl>
-                <dt>Speed</dt><dd id="statSpeed">—</dd>
-                <dt>Speed (audio)</dt><dd id="statSpeedAudio">—</dd>
-                <dt>Flight time</dt><dd id="statTime">—</dd>
-                <dt>Flight time (audio)</dt><dd id="statTimeAudio">—</dd>
-                <dt>Distance</dt><dd id="statDist">—</dd>
-                <dt>Hit offset</dt><dd id="statOffset">—</dd>
-                <dt>Energy</dt><dd id="statEnergy">—</dd>
-                <dt>Processed in</dt><dd id="statProcessed" class="stat-toggle" title="click for breakdown">—</dd>
-              </dl>
-              <dl id="timingsBreakdown" class="hidden timings-breakdown">
+        </div>
+      </div>
+
+      <div class="telemetry-row">
+        <div class="telemetry-wrap">
+          <div class="telemetry-head">
+            <h3>Telemetry</h3>
+            <span id="telemetryInfo"></span>
+            <button id="statsToggleBtn" class="stats-toggle-btn" title="show/hide stats panel">📊 Stats</button>
+            <span class="head-processed">
+              <span class="head-processed-label">processed</span>
+              <span id="statProcessed">—</span>
+              <dl id="timingsBreakdown" class="head-timings-popup">
                 <dt>decode</dt><dd id="timingDecode">—</dd>
                 <dt>detect</dt><dd id="timingDetect">—</dd>
                 <dt>track</dt><dd id="timingTrack">—</dd>
                 <dt>trim</dt><dd id="timingTrim">—</dd>
               </dl>
-            </div>
-            <div class="stats-block">
-              <h4>Group (<span id="groupCount">0</span>)</h4>
-              <dl>
-                <dt>Extreme spread</dt><dd id="statExtreme">—</dd>
-                <dt>Mean radius</dt><dd id="statMeanR">—</dd>
-              </dl>
+            </span>
+          </div>
+          <div class="telemetry-stage">
+            <canvas id="telemetryCanvas"></canvas>
+            <div class="shot-stats telemetry-stats hidden">
+              <div class="stats-block">
+                <h4>Shot #<span id="statsShotNum">?</span></h4>
+                <dl>
+                  <dt>Speed</dt><dd id="statSpeed">—</dd>
+                  <dt>Flight time</dt><dd id="statTime">—</dd>
+                  <dt>Distance</dt><dd id="statDist">—</dd>
+                  <dt>Hit offset</dt><dd id="statOffset">—</dd>
+                  <dt>Energy</dt><dd id="statEnergy">—</dd>
+                </dl>
+              </div>
+              <div class="stats-block">
+                <h4>Group (<span id="groupCount">0</span>)</h4>
+                <dl>
+                  <dt>Extreme spread</dt><dd id="statExtreme">—</dd>
+                  <dt>Mean radius</dt><dd id="statMeanR">—</dd>
+                </dl>
+              </div>
             </div>
           </div>
         </div>
-      </div>
 
-      <div class="telemetry-wrap">
-        <div class="telemetry-head">
-          <h3>Telemetry</h3>
-          <span id="telemetryInfo"></span>
-        </div>
-        <canvas id="telemetryCanvas"></canvas>
+        <aside class="telemetry-side">
+          <figure class="target-photo">
+            <img id="lastShotTargetPhoto" alt="target after shot" />
+            <figcaption>target</figcaption>
+          </figure>
+          <div class="accuracy-stats">
+            <div class="stats-block">
+              <h4>Accuracy</h4>
+              <dl>
+                <dt>Ring</dt><dd id="statRing">—</dd>
+                <dt>Hit X</dt><dd id="statHitX">—</dd>
+                <dt>Hit Y</dt><dd id="statHitY">—</dd>
+              </dl>
+              <p class="placeholder-note">photo-based metrics pending CV</p>
+            </div>
+          </div>
+        </aside>
       </div>
     </section>
 

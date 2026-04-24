@@ -11,29 +11,41 @@ function setStatus(msg, isError = false) {
 
 // ==== Tabs ================================================================
 
-const tabButtons = document.querySelectorAll("#tabs button");
+const tabButtons = document.querySelectorAll("#tabs button[data-tab]");
 const tabPanels = document.querySelectorAll(".tab-panel");
 let currentTab = "session";
+
+const shootTabActions = document.getElementById("shootTabActions");
 
 function activateTab(name) {
   if (currentTab === name) return;
   currentTab = name;
   for (const b of tabButtons) b.classList.toggle("active", b.dataset.tab === name);
   for (const p of tabPanels) p.classList.toggle("active", p.dataset.tab === name);
+  shootTabActions.classList.toggle("hidden", name !== "shoot");
   if (name === "shoot") {
     // Canvas size depends on visibility; resize now that it's visible.
     requestAnimationFrame(sizeCanvas);
   }
 }
-for (const b of tabButtons) b.addEventListener("click", () => activateTab(b.dataset.tab));
+for (const b of tabButtons) {
+  // Ignore clicks on nested elements inside the tab-actions cluster.
+  if (!b.dataset.tab) continue;
+  b.addEventListener("click", () => activateTab(b.dataset.tab));
+}
 
 // ==== Live session DOM ====================================================
 
-const phoneStatus = document.getElementById("phoneStatus");
-const sessionStatus = document.getElementById("sessionStatus");
-const rangeStatus = document.getElementById("rangeStatus");
-const calibStatus = document.getElementById("calibStatus");
-const shotCountEl = document.getElementById("shotCount");
+const bulbPhone = document.getElementById("bulbPhone");
+const bulbSession = document.getElementById("bulbSession");
+const bulbRange = document.getElementById("bulbRange");
+const bulbCalib = document.getElementById("bulbCalib");
+const bulbShotCount = document.getElementById("bulbShotCount");
+
+function setBulb(el, ok, title) {
+  el.className = el.classList.contains("shot-count-bulb") ? "bulb shot-count-bulb" : "bulb " + (ok ? "ok" : "bad");
+  el.title = title;
+}
 
 const rangeSt = document.getElementById("rangeSt");
 const rangeCp = document.getElementById("rangeCp");
@@ -72,12 +84,11 @@ const lastShotTracked = document.getElementById("lastShotTracked");
 const lastShotNum = document.getElementById("lastShotNum");
 const shotHistory = document.getElementById("shotHistory");
 const shotHistoryList = document.getElementById("shotHistoryList");
+const lastShotTargetPhoto = document.getElementById("lastShotTargetPhoto");
 let selectedShotIdx = null; // index into shots[] of the currently displayed shot
 const statsShotNum = document.getElementById("statsShotNum");
 const statSpeed = document.getElementById("statSpeed");
-const statSpeedAudio = document.getElementById("statSpeedAudio");
 const statTime = document.getElementById("statTime");
-const statTimeAudio = document.getElementById("statTimeAudio");
 const statDist = document.getElementById("statDist");
 const statOffset = document.getElementById("statOffset");
 const statEnergy = document.getElementById("statEnergy");
@@ -87,9 +98,21 @@ const timingDecode = document.getElementById("timingDecode");
 const timingDetect = document.getElementById("timingDetect");
 const timingTrack = document.getElementById("timingTrack");
 const timingTrim = document.getElementById("timingTrim");
-statProcessed.addEventListener("click", () => {
-  timingsBreakdown.classList.toggle("hidden");
+// Stats panel toggle button in the Telemetry header. Persisted across reloads.
+const statsToggleBtn = document.getElementById("statsToggleBtn");
+const telemetryStats = document.querySelector(".telemetry-stats");
+const STATS_KEY = "arrowlab.statsPanelOpen";
+function applyStatsPanelVisibility() {
+  const open = localStorage.getItem(STATS_KEY) === "1";
+  telemetryStats.classList.toggle("hidden", !open);
+  statsToggleBtn.classList.toggle("on", open);
+}
+statsToggleBtn.addEventListener("click", () => {
+  const wasOpen = localStorage.getItem(STATS_KEY) === "1";
+  localStorage.setItem(STATS_KEY, wasOpen ? "0" : "1");
+  applyStatsPanelVisibility();
 });
+applyStatsPanelVisibility();
 const groupCount = document.getElementById("groupCount");
 const statExtreme = document.getElementById("statExtreme");
 const statMeanR = document.getElementById("statMeanR");
@@ -149,19 +172,17 @@ function logLive(line, kind = "info") {
 }
 
 function applyState(st) {
-  phoneStatus.textContent = st.phone_connected ? "connected" : "none";
-  phoneStatus.className = "pill " + (st.phone_connected ? "ok" : "bad");
-
-  sessionStatus.textContent = st.active ? (st.session_id || "active") : "none";
-  sessionStatus.className = "pill " + (st.active ? "ok" : "bad");
-
-  rangeStatus.textContent = st.has_range ? "yes" : "no";
-  rangeStatus.className = "pill " + (st.has_range ? "ok" : "bad");
-
-  calibStatus.textContent = st.has_annotation ? "yes" : "no";
-  calibStatus.className = "pill " + (st.has_annotation ? "ok" : "bad");
-
-  shotCountEl.textContent = `${st.shot_count || 0} shots`;
+  setBulb(bulbPhone, st.phone_connected,
+    st.phone_connected ? "phone: connected" : "phone: none");
+  setBulb(bulbSession, st.active,
+    st.active ? `session: ${st.session_id || "active"}` : "session: none");
+  setBulb(bulbRange, st.has_range,
+    st.has_range ? "range: set" : "range: not set");
+  setBulb(bulbCalib, st.has_annotation,
+    st.has_annotation ? "calibrated" : "not calibrated");
+  const n = st.shot_count || 0;
+  bulbShotCount.textContent = String(n);
+  bulbShotCount.title = `${n} shot${n === 1 ? "" : "s"}`;
 
   startSessionBtn.disabled = !!st.active;
   endSessionBtn.disabled = !st.active;
@@ -330,21 +351,30 @@ function handleLiveMsg(msg) {
     updateCalibAnnotationView();
   } else if (msg.type === "shot_uploaded") {
     logLive(`shot ${msg.shot}: ${(msg.bytes / 1024 / 1024).toFixed(1)} MB uploaded, processing...`);
-    setShotButton("tracking");
+    if (!armed) setShotButton("tracking");
   } else if (msg.type === "shot_ready") {
     logLive(`shot ${msg.shot}: ready`, "ok");
     // shots[] is synced by the state broadcast that follows; just select the new one.
-    pendingShotIdx = shots.length; // the incoming shot will be appended at this index
-    // Defer selection until the state broadcast lands shots[]
+    pendingShotIdx = shots.length;
     setTimeout(() => {
       const idx = shots.findIndex(sh => sh.shot === msg.shot);
       if (idx >= 0) selectShot(idx, { play: false });
     }, 50);
-    setShotButton("idle");
+    // Don't override the ARMED UI — armed mode keeps listening for the next shot.
+    if (!armed) setShotButton("idle");
+    else flashFire();
   } else if (msg.type === "shot_failed") {
     logLive(`shot ${msg.shot}: FAILED (${msg.reason || "unknown"})`, "error");
-    setShotButton("error");
-    setTimeout(() => setShotButton("idle"), 3000);
+    if (!armed) {
+      setShotButton("error");
+      setTimeout(() => setShotButton("idle"), 3000);
+    }
+  } else if (msg.type === "armed") {
+    logLive("armed — listening for release+impact", "ok");
+    setArmedUI(true);
+  } else if (msg.type === "disarmed") {
+    logLive("disarmed");
+    setArmedUI(false);
   } else if (msg.type === "error") {
     logLive(`error: ${msg.msg}`, "error");
   }
@@ -458,12 +488,58 @@ function abortCountdown() {
   setShotButton("idle");
 }
 
+let armed = false;
+
+// Full-viewport "FIRE" flash, shown after each processed shot while armed.
+// Visual only — voice cues were leaking into the phone mic and tripping the
+// onset detector.
+let fireFlashEl = null;
+function flashFire() {
+  if (!fireFlashEl) {
+    fireFlashEl = document.createElement("div");
+    fireFlashEl.className = "fire-flash";
+    fireFlashEl.textContent = "FIRE";
+    document.body.appendChild(fireFlashEl);
+  }
+  fireFlashEl.classList.remove("show");
+  // Force reflow so the next class-add restarts the CSS animation.
+  void fireFlashEl.offsetWidth;
+  fireFlashEl.classList.add("show");
+}
+
+function setArmedUI(on) {
+  armed = on;
+  if (on) {
+    shotBtn.textContent = "ARMED — tap to stop";
+    shotBtn.style.background = "#b05020";
+    shotBtn.disabled = false;
+  } else {
+    setShotButton("idle");
+  }
+}
+
 shotBtn.addEventListener("click", () => {
   if (shotInFlight) {
     abortCountdown();
     return;
   }
-  startShotCountdown();
+  if (armed) {
+    if (liveWS && liveWS.readyState === WebSocket.OPEN) {
+      liveWS.send(JSON.stringify({ type: "disarm" }));
+    }
+    setArmedUI(false);
+    return;
+  }
+  // Prefer armed mode when the phone has audio onset detection. Hold Shift
+  // on click to force the legacy countdown flow.
+  const forceCountdown = window.event && window.event.shiftKey;
+  if (forceCountdown) {
+    startShotCountdown();
+    return;
+  }
+  if (liveWS && liveWS.readyState === WebSocket.OPEN) {
+    liveWS.send(JSON.stringify({ type: "arm" }));
+  }
 });
 
 // ==== Calibration annotation canvas ======================================
@@ -670,10 +746,30 @@ function shotColor(i) {
 }
 
 function getViewBox() {
-  // Full-frame view so the trajectory overlays the actual scene.
+  // Crop to a horizontal band around the flight corridor (plus the target
+  // bbox if it falls outside) — the arrow never flies through the top/bottom
+  // of the frame so those pixels are wasted and force a tall canvas.
   const latest = shots[shots.length - 1]?.trajectory;
   const imgW = latest?.width || telemetryBg.naturalWidth || 1920;
   const imgH = latest?.height || telemetryBg.naturalHeight || 1080;
+  const ann = latest?.annotation || {};
+  const corridor = ann.corridor;
+  const bbox = ann.target?.bbox;
+  if (corridor) {
+    let y0 = corridor.y_top;
+    let y1 = corridor.y_bottom;
+    if (bbox && bbox.length === 4) {
+      y0 = Math.min(y0, bbox[1]);
+      y1 = Math.max(y1, bbox[3]);
+    }
+    const pad = Math.max(30, Math.round((y1 - y0) * 0.15));
+    return {
+      x0: 0,
+      y0: Math.max(0, y0 - pad),
+      x1: imgW,
+      y1: Math.min(imgH, y1 + pad),
+    };
+  }
   return { x0: 0, y0: 0, x1: imgW, y1: imgH };
 }
 
@@ -682,7 +778,9 @@ function sizeCanvas() {
   const vb = getViewBox();
   const aspect = (vb.x1 - vb.x0) / Math.max(1, vb.y1 - vb.y0);
   const cssW = parentW;
-  const cssH = Math.max(120, Math.min(360, cssW / aspect));
+  // Honour the crop aspect ratio so nothing stretches. Cap height at a level
+  // that keeps the whole Shoot tab visible without scrolling.
+  const cssH = Math.max(100, Math.min(240, cssW / aspect));
   telemetryCanvas.style.height = `${Math.round(cssH)}px`;
   telemetryCanvas.width = Math.round(cssW);
   telemetryCanvas.height = Math.round(cssH);
@@ -729,10 +827,10 @@ function renderTelemetry(currentTime = null) {
   const mapX = (x) => (x - vb.x0) * sx;
   const mapY = (y) => (y - vb.y0) * sy;
 
-  // Scene background: the calibration JPEG, same frame the operator
-  // annotated. Dims the image so trajectories stand out.
+  // Scene background: the calibration JPEG, cropped to the viewbox so it
+  // matches the trajectory space (no stretch).
   if (telemetryBgLoaded) {
-    telemetryCtx.drawImage(telemetryBg, 0, 0, w, h);
+    telemetryCtx.drawImage(telemetryBg, vb.x0, vb.y0, vbW, vbH, 0, 0, w, h);
     telemetryCtx.fillStyle = "rgba(0,0,0,0.3)";
     telemetryCtx.fillRect(0, 0, w, h);
   }
@@ -904,6 +1002,11 @@ function selectShot(idx, { play = false } = {}) {
   lastShotNum.textContent = sh.shot;
   if (sh.clip_url) lastShotClip.src = sh.clip_url + "?t=" + Date.now();
   if (sh.tracked_url) lastShotTracked.src = sh.tracked_url + "?t=" + Date.now();
+  if (sh.target_photo_url) {
+    lastShotTargetPhoto.src = sh.target_photo_url + "?t=" + Date.now();
+  } else {
+    lastShotTargetPhoto.removeAttribute("src");
+  }
   lastShot.classList.remove("hidden");
   playAllBtn.disabled = false;
   pauseAllBtn.disabled = false;
@@ -1039,8 +1142,7 @@ function updateStats() {
   if (!shot) {
     statsShotNum.textContent = "?";
     statSpeed.textContent = statTime.textContent = statDist.textContent =
-      statOffset.textContent = statEnergy.textContent = statProcessed.textContent =
-      statSpeedAudio.textContent = statTimeAudio.textContent = "—";
+      statOffset.textContent = statEnergy.textContent = statProcessed.textContent = "—";
     groupCount.textContent = "0";
     statExtreme.textContent = statMeanR.textContent = "—";
     return;
@@ -1055,24 +1157,31 @@ function updateStats() {
   timingTrack.textContent = fmtS(tim?.track_s);
   timingTrim.textContent = fmtS(tim?.trim_s);
   const s = computeShotStats(shot);
+  // Speed + flight time: prefer the acoustic chronograph (more accurate than
+  // the pixel tracker). Fall back to the tracker derivation if audio is
+  // missing. Energy also uses the preferred speed.
+  const audioSpeed = Number.isFinite(shot.speed_audio_ms) ? shot.speed_audio_ms : null;
+  const audioTimeMs = Number.isFinite(shot.audio_release_s) && Number.isFinite(shot.audio_impact_s)
+    ? (shot.audio_impact_s - shot.audio_release_s) * 1000
+    : null;
+  const speedMs = audioSpeed != null ? audioSpeed : (s?.speedMs ?? null);
+  const flightMs = audioTimeMs != null ? audioTimeMs : (s ? s.durSec * 1000 : null);
+  statSpeed.textContent = speedMs != null ? fmt(speedMs, 1, " m/s") : "—";
+  statTime.textContent = flightMs != null ? fmt(flightMs, 0, " ms") : "—";
   if (s) {
-    statSpeed.textContent = fmt(s.speedMs, 1, " m/s");
-    statTime.textContent = fmt(s.durSec * 1000, 0, " ms");
     statDist.textContent = fmt(s.distanceM, 2, " m");
     statOffset.textContent = fmt(s.hitOffsetCm, 1, " cm");
-    statEnergy.textContent = s.keJ != null
-      ? `${s.keJ.toFixed(1)} J / ${s.keFtLbs.toFixed(1)} ft·lbs`
-      : "— (need arrow mass)";
-  }
-  // Audio-derived chronograph values (independent of tracker)
-  statSpeedAudio.textContent = Number.isFinite(shot.speed_audio_ms)
-    ? fmt(shot.speed_audio_ms, 1, " m/s")
-    : "—";
-  if (Number.isFinite(shot.audio_release_s) && Number.isFinite(shot.audio_impact_s)) {
-    const gapMs = (shot.audio_impact_s - shot.audio_release_s) * 1000;
-    statTimeAudio.textContent = fmt(gapMs, 0, " ms");
-  } else {
-    statTimeAudio.textContent = "—";
+    // Recompute energy against the preferred speed
+    const massGrains = shot.trajectory?.range?.arrow_mass_grains
+      ?? (currentRange?.arrow_mass_grains ?? null);
+    const massKg = massGrains ? massGrains * 6.479891e-5 : null;
+    if (speedMs != null && massKg) {
+      const keJ = 0.5 * massKg * speedMs * speedMs;
+      const keFtLbs = keJ * 0.737562;
+      statEnergy.textContent = `${keJ.toFixed(1)} J / ${keFtLbs.toFixed(1)} ft·lbs`;
+    } else {
+      statEnergy.textContent = "— (need arrow mass)";
+    }
   }
   const g = computeGroup(shots);
   groupCount.textContent = g.count;

@@ -324,8 +324,18 @@ class CameraController(
         val handler = bgHandler
         if (rec == null || handler == null) { onDone(null); return }
         handler.post {
-            val bytes = rec.sliceLastSeconds(seconds)
-            onDone(bytes)
+            val result = rec.sliceLastSeconds(seconds)
+            onDone(result?.bytes)
         }
+    }
+
+    fun arm(onShot: (bytes: ByteArray, releasePtsUs: Long, impactPtsUs: Long, videoDurationS: Double) -> Unit): Boolean {
+        val rec = shotRecorder ?: return false
+        rec.arm(onShot)
+        return true
+    }
+
+    fun disarm() {
+        shotRecorder?.disarm()
     }
 }
