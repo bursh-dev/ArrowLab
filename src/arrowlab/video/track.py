@@ -379,7 +379,17 @@ def track_clip(
     # fine-grained timebase (e.g. 1/89409) that MPEG-4 Part 2 (mp4v)
     # rejects with "maximum admitted denominator is 65535".
     writer_fps = max(1, int(round(fps)))
-    writer = cv2.VideoWriter(str(tracked_path), fourcc, float(writer_fps), (w, h))
+    # Downscale the tracked mp4 to ~960px wide to halve encode time. The
+    # operator only reviews these clips visually; detection already ran at
+    # full resolution so accuracy is unaffected.
+    out_w, out_h = w, h
+    scale = 1.0
+    if w > 960:
+        scale = 960.0 / w
+        out_w = 960
+        out_h = int(round(h * scale))
+        if out_h % 2 == 1: out_h -= 1
+    writer = cv2.VideoWriter(str(tracked_path), fourcc, float(writer_fps), (out_w, out_h))
     kept_by_frame = {d["frame"]: d for d in cleaned}
     trail: list[tuple[int, int]] = []
 
@@ -420,6 +430,8 @@ def track_clip(
             vis, f"frame {global_frame}", (10, 40),
             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2,
         )
+        if scale != 1.0:
+            vis = cv2.resize(vis, (out_w, out_h), interpolation=cv2.INTER_AREA)
         writer.write(vis)
     writer.release()
     _t_write = _t.perf_counter()

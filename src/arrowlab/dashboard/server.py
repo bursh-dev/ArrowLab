@@ -1045,15 +1045,28 @@ async def _process_shot(
         writer_fps_int = max(1, int(round(fps)))
         clip_trim = slice_path.with_name(slice_path.stem + "_trim.mp4")
         from arrowlab.video.encode import to_h264_faststart
+        # Downscale raw trim to ~960 wide to match the tracked mp4 and cut
+        # cv2 encode time roughly in half. Operator only views these clips,
+        # analysis already happened at full res.
+        raw_out_w, raw_out_h = w, h
+        raw_scale = 1.0
+        if w > 960:
+            raw_scale = 960.0 / w
+            raw_out_w = 960
+            raw_out_h = int(round(h * raw_scale))
+            if raw_out_h % 2 == 1: raw_out_h -= 1
         raw_writer = cv2.VideoWriter(
             str(clip_trim),
             cv2.VideoWriter_fourcc(*"mp4v"),
             float(writer_fps_int),
-            (w, h),
+            (raw_out_w, raw_out_h),
         )
         try:
             for i in range(tfirst - 1, min(tlast, len(frames))):
-                raw_writer.write(frames[i])
+                f = frames[i]
+                if raw_scale != 1.0:
+                    f = cv2.resize(f, (raw_out_w, raw_out_h), interpolation=cv2.INTER_AREA)
+                raw_writer.write(f)
         finally:
             raw_writer.release()
         to_h264_faststart(clip_trim)
