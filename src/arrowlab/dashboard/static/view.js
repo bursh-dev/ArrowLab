@@ -17,6 +17,93 @@ let currentTab = "session";
 
 const shootTabActions = document.getElementById("shootTabActions");
 
+// ==== Sound calibration ==================================================
+
+const soundShotsList = document.getElementById("soundShotsList");
+const reloadSoundShotsBtn = document.getElementById("reloadSoundShotsBtn");
+const saveSoundTemplateBtn = document.getElementById("saveSoundTemplateBtn");
+const soundTemplateStatus = document.getElementById("soundTemplateStatus");
+
+// Map<shot:number, {release:boolean, impact:boolean}>
+const soundAccepts = new Map();
+
+async function reloadSoundShots() {
+  const res = await fetch("/api/calibration-sound/shots");
+  if (!res.ok) { logLive("sound shots fetch failed: " + res.status, "error"); return; }
+  const { shots: list } = await res.json();
+  soundShotsList.innerHTML = "";
+  if (!list || list.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "shoot-hint";
+    empty.textContent = "no shots with audio events yet — fire a few armed shots first";
+    soundShotsList.appendChild(empty);
+  }
+  for (const sh of list) {
+    const row = document.createElement("div");
+    row.className = "sound-shot-row";
+    row.innerHTML = `
+      <span class="shot-label">#${sh.shot}</span>
+      <div class="sound-snippet">
+        <span>release</span>
+        <audio controls preload="none" src="${sh.release_snippet_url}"></audio>
+        <button class="accept-btn" data-kind="release" data-shot="${sh.shot}">✓ accept</button>
+      </div>
+      <div class="sound-snippet">
+        <span>impact</span>
+        <audio controls preload="none" src="${sh.impact_snippet_url}"></audio>
+        <button class="accept-btn" data-kind="impact" data-shot="${sh.shot}">✓ accept</button>
+      </div>
+    `;
+    soundShotsList.appendChild(row);
+  }
+  // Wire up accept toggles
+  soundShotsList.querySelectorAll(".accept-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const shot = parseInt(btn.dataset.shot, 10);
+      const kind = btn.dataset.kind;
+      const state = soundAccepts.get(shot) || { release: false, impact: false };
+      state[kind] = !state[kind];
+      soundAccepts.set(shot, state);
+      btn.classList.toggle("on", state[kind]);
+      updateSoundSaveButton();
+    });
+  });
+  updateSoundSaveButton();
+}
+
+function updateSoundSaveButton() {
+  let r = 0, i = 0;
+  for (const v of soundAccepts.values()) {
+    if (v.release) r++;
+    if (v.impact) i++;
+  }
+  saveSoundTemplateBtn.textContent = `Save template (${r} release / ${i} impact)`;
+  saveSoundTemplateBtn.disabled = !(r >= 1 && i >= 1);
+}
+
+reloadSoundShotsBtn.addEventListener("click", reloadSoundShots);
+saveSoundTemplateBtn.addEventListener("click", async () => {
+  const accepted_release_shots = [];
+  const accepted_impact_shots = [];
+  for (const [shot, v] of soundAccepts.entries()) {
+    if (v.release) accepted_release_shots.push(shot);
+    if (v.impact) accepted_impact_shots.push(shot);
+  }
+  const res = await fetch("/api/calibration-sound/template", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ accepted_release_shots, accepted_impact_shots }),
+  });
+  if (!res.ok) {
+    soundTemplateStatus.textContent = "save failed: " + await res.text();
+    return;
+  }
+  const j = await res.json();
+  soundTemplateStatus.textContent =
+    `saved: ${j.release_count} release / ${j.impact_count} impact, ${j.template_bins} bins`;
+  logLive(`sound template saved (${j.release_count}R/${j.impact_count}I)`, "ok");
+});
+
 function activateTab(name) {
   if (currentTab === name) return;
   currentTab = name;
@@ -27,6 +114,7 @@ function activateTab(name) {
     // Canvas size depends on visibility; resize now that it's visible.
     requestAnimationFrame(sizeCanvas);
   }
+  if (name === "sound") reloadSoundShots();
 }
 for (const b of tabButtons) {
   // Ignore clicks on nested elements inside the tab-actions cluster.
@@ -1022,19 +1110,46 @@ function selectShot(idx, { play = false } = {}) {
 
 let playRaf = 0;
 let playActive = false;
+const scheduledSoundTimers = [];
+function clearScheduledSounds() {
+  while (scheduledSoundTimers.length) clearTimeout(scheduledSoundTimers.pop());
+}
+function playSnippet(url) {
+  try {
+    const a = new Audio(url);
+    a.volume = 1.0;
+    a.playbackRate = 1.0;
+    a.play().catch(() => {});
+  } catch (_) {}
+}
 function startSyncPlay() {
   if (shots.length === 0) return;
   const idx = selectedShotIdx != null ? selectedShotIdx : shots.length - 1;
-  // Re-arm the selected shot as pending so its trajectory hides and animates
-  // fresh on every Play press.
   pendingShotIdx = idx;
-  telemetryInfo.textContent = `shot ${shots[idx].shot} (playing 0.0625×)`;
+  const playbackRate = 0.0625;
+  telemetryInfo.textContent = `shot ${shots[idx].shot} (playing ${playbackRate}×)`;
   const shot = shots[idx] || {};
   const startS = Number.isFinite(shot.start_s) ? shot.start_s : 0;
   try { lastShotClip.currentTime = startS; } catch {}
   try { lastShotTracked.currentTime = startS; } catch {}
-  lastShotClip.playbackRate = 0.0625;
-  lastShotTracked.playbackRate = 0.0625;
+  lastShotClip.playbackRate = playbackRate;
+  lastShotTracked.playbackRate = playbackRate;
+  // Mute the raw clip — slow-mo'd audio sounds awful. Instead, schedule the
+  // 300 ms release/impact snippets (at their original 1× rate) to fire at
+  // the correct moments in the slow-mo timeline.
+  lastShotClip.muted = true;
+  clearScheduledSounds();
+  const trimOff = Number.isFinite(shot.trim_offset_s) ? shot.trim_offset_s : 0;
+  const releaseS = Number.isFinite(shot.audio_release_s) ? shot.audio_release_s : null;
+  const impactS = Number.isFinite(shot.audio_impact_s) ? shot.audio_impact_s : null;
+  const scheduleSnippet = (atSrcSec, url) => {
+    if (atSrcSec == null) return;
+    const delayMs = Math.max(0, (atSrcSec - trimOff - startS) / playbackRate * 1000);
+    scheduledSoundTimers.push(setTimeout(() => playSnippet(url), delayMs));
+  };
+  scheduleSnippet(releaseS, `/api/calibration-sound/snippet/${shot.shot}/release`);
+  scheduleSnippet(impactS, `/api/calibration-sound/snippet/${shot.shot}/impact`);
+
   Promise.all([lastShotClip.play(), lastShotTracked.play()]).catch(() => {});
   playActive = true;
   if (playRaf) cancelAnimationFrame(playRaf);
@@ -1062,6 +1177,7 @@ function stopSyncPlay() {
   playActive = false;
   lastShotClip.pause();
   lastShotTracked.pause();
+  clearScheduledSounds();
   if (playRaf) { cancelAnimationFrame(playRaf); playRaf = 0; }
   renderTelemetry();
 }

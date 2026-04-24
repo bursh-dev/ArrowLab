@@ -170,7 +170,7 @@ def _persist_session() -> None:
         SESSION_STATE_FILE.unlink(missing_ok=True)
         return
     SESSION_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    data = {k: s[k] for k in ("id", "stem", "created_at", "range", "calibration_frame", "annotation", "shot_count", "fake_source", "shots")}
+    data = {k: s.get(k) for k in ("id", "stem", "created_at", "range", "calibration_frame", "annotation", "shot_count", "fake_source", "shots", "sound_template")}
     SESSION_STATE_FILE.write_text(json.dumps(data, indent=2))
 
 
@@ -182,7 +182,7 @@ def _load_persisted_session() -> None:
     except Exception:
         return
     s = _new_session()
-    for k in ("id", "stem", "created_at", "range", "calibration_frame", "annotation", "shot_count", "fake_source", "shots"):
+    for k in ("id", "stem", "created_at", "range", "calibration_frame", "annotation", "shot_count", "fake_source", "shots", "sound_template"):
         if k in data:
             s[k] = data[k]
     # Recover shots from on-disk trajectories if persisted list is empty
@@ -399,6 +399,161 @@ async def api_session_delete_shot(n: int) -> dict:
     return {"ok": True, "removed": removed}
 
 
+# ============================================================================
+# Sound-calibration endpoints: extract short audio snippets around each shot's
+# release/impact so the operator can accept/reject them by ear and the server
+# can average the accepted ones into a per-session template.
+# ============================================================================
+
+SOUND_SNIPPET_DIR = DATA_RAW / "sessions" / "sound_snippets"
+SNIPPET_DURATION_S = 0.30
+
+
+def _extract_snippet(src_mp4: Path, at_s: float, out_path: Path) -> None:
+    """Cut SNIPPET_DURATION_S of audio centred on `at_s` from `src_mp4`
+    into a mono 16 kHz wav at `out_path`."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    start = max(0.0, at_s - SNIPPET_DURATION_S / 2)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-ss", f"{start:.3f}",
+            "-i", str(src_mp4),
+            "-t", f"{SNIPPET_DURATION_S:.3f}",
+            "-vn",
+            "-ac", "1", "-ar", "16000",
+            "-c:a", "pcm_s16le",
+            str(out_path),
+        ],
+        check=True,
+    )
+
+
+@app.get("/api/calibration-sound/shots")
+def api_calibration_sound_shots() -> dict:
+    """List shots that have detected audio events, ready for calibration."""
+    s = _require_session()
+    out: list[dict] = []
+    for sh in s.get("shots", []) or []:
+        r = sh.get("audio_release_s")
+        i = sh.get("audio_impact_s")
+        if r is None or i is None:
+            continue
+        out.append({
+            "shot": sh["shot"],
+            "release_s": r,
+            "impact_s": i,
+            "release_snippet_url": f"/api/calibration-sound/snippet/{sh['shot']}/release",
+            "impact_snippet_url": f"/api/calibration-sound/snippet/{sh['shot']}/impact",
+        })
+    return {"shots": out}
+
+
+@app.get("/api/calibration-sound/snippet/{shot:int}/{kind}")
+def api_calibration_sound_snippet(shot: int, kind: str):
+    from fastapi.responses import FileResponse
+    if kind not in ("release", "impact"):
+        raise HTTPException(400, "kind must be release or impact")
+    s = _require_session()
+    match = next((sh for sh in s.get("shots", []) or [] if int(sh.get("shot") or 0) == shot), None)
+    if match is None:
+        raise HTTPException(404, f"shot {shot} not in session")
+    at_s = match.get(f"audio_{kind}_s")
+    if at_s is None:
+        raise HTTPException(404, f"shot {shot} has no {kind} timestamp")
+    src = DATA_RAW / "sessions" / f"{s['stem']}_shot{shot:02d}.mp4"
+    if not src.exists():
+        raise HTTPException(404, f"source mp4 missing for shot {shot}")
+    out = SOUND_SNIPPET_DIR / f"{s['stem']}_shot{shot:02d}_{kind}.wav"
+    if not out.exists():
+        try:
+            _extract_snippet(src, float(at_s), out)
+        except subprocess.CalledProcessError as e:
+            raise HTTPException(500, f"ffmpeg failed: {e}")
+    return FileResponse(out, media_type="audio/wav")
+
+
+class SoundTemplateRequest(BaseModel):
+    accepted_release_shots: list[int]
+    accepted_impact_shots: list[int]
+
+
+@app.put("/api/calibration-sound/template")
+def api_calibration_sound_template(req: SoundTemplateRequest) -> dict:
+    """Compute release + impact templates by averaging the log-magnitude
+    spectra of the accepted snippets. Stored per-session in _active.json."""
+    import numpy as np
+    s = _require_session()
+    stem = s["stem"]
+
+    def _snippet_spectrum(shot: int, kind: str) -> "np.ndarray | None":
+        wav = SOUND_SNIPPET_DIR / f"{stem}_shot{shot:02d}_{kind}.wav"
+        if not wav.exists():
+            # Extract on demand if the UI never pre-fetched it.
+            match = next((sh for sh in s.get("shots", []) or [] if int(sh.get("shot") or 0) == shot), None)
+            at_s = match and match.get(f"audio_{kind}_s")
+            src = DATA_RAW / "sessions" / f"{stem}_shot{shot:02d}.mp4"
+            if match is None or at_s is None or not src.exists():
+                return None
+            try:
+                _extract_snippet(src, float(at_s), wav)
+            except subprocess.CalledProcessError:
+                return None
+        # Decode wav → numpy float32 via ffmpeg (avoids pulling in wave module quirks).
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "error", "-nostdin", "-i", str(wav),
+             "-f", "f32le", "-ac", "1", "-ar", "16000", "-"],
+            capture_output=True, check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return None
+        pcm = np.frombuffer(proc.stdout, dtype=np.float32)
+        # Log-magnitude spectrum of a 4096-sample (≈256 ms) window, zero-padded
+        # or cropped. Magnitudes captured in 257 bins (rfft of 512 shaped).
+        N = 4096
+        if pcm.size < 512:
+            return None
+        x = np.zeros(N, dtype=np.float32)
+        src = pcm[: min(pcm.size, N)]
+        x[: src.size] = src
+        # Hann window to reduce spectral leakage.
+        x *= np.hanning(N).astype(np.float32)
+        spec = np.abs(np.fft.rfft(x))
+        log_mag = np.log1p(spec)
+        # L2-normalise so templates are invariant to loudness.
+        norm = float(np.linalg.norm(log_mag))
+        if norm == 0.0:
+            return None
+        return (log_mag / norm).astype(np.float32)
+
+    def _average(shots: list[int], kind: str) -> list[float] | None:
+        specs = [s for s in (_snippet_spectrum(sh, kind) for sh in shots) if s is not None]
+        if not specs:
+            return None
+        mean = np.mean(np.stack(specs), axis=0)
+        mean = mean / max(float(np.linalg.norm(mean)), 1e-12)
+        return mean.tolist()
+
+    release_template = _average(req.accepted_release_shots, "release")
+    impact_template = _average(req.accepted_impact_shots, "impact")
+    if release_template is None or impact_template is None:
+        raise HTTPException(400, "need at least one accepted snippet of each kind")
+
+    s["sound_template"] = {
+        "release": release_template,
+        "impact": impact_template,
+        "release_count": len(req.accepted_release_shots),
+        "impact_count": len(req.accepted_impact_shots),
+    }
+    _persist_session()
+    return {
+        "ok": True,
+        "release_count": len(req.accepted_release_shots),
+        "impact_count": len(req.accepted_impact_shots),
+        "template_bins": len(release_template),
+    }
+
+
 @app.put("/api/session/annotation")
 async def api_session_annotation(annotation: SessionAnnotation) -> dict:
     s = _require_session()
@@ -536,6 +691,18 @@ def _audio_chronograph_speed_ms(release_s: float | None, impact_s: float | None,
     if gap_corrected <= 0:
         return None
     return float(D / gap_corrected)
+
+
+def _probe_duration_s(path: Path) -> float | None:
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            text=True,
+        )
+        return float(out.strip())
+    except Exception:
+        return None
 
 
 def _extract_target_photo(
@@ -914,11 +1081,16 @@ async def _process_shot(
 
         # Target photo: grab a frame ~300 ms after impact (arrow already
         # embedded, vibration mostly settled) and crop to the annotated
-        # target bbox. Cheap path — no phone-side still capture needed.
+        # target bbox. Clamp to ~50 ms before the end of the mp4 — armed-
+        # mode clips are ~1.5 s long so impact+0.3 s can land past EOF.
         target_photo_url: str | None = None
         impact_s = audio_events.get("impact_s")
         bbox = (annotation.get("target") or {}).get("bbox") if annotation else None
-        photo_at_s = (impact_s if impact_s is not None else (tlast - 1) / fps) + 0.3
+        # Fallback seek point if we have no impact timestamp.
+        fallback_s = max(0.0, (tlast - 1) / fps)
+        raw_duration_s = _probe_duration_s(slice_path) or fallback_s + 0.5
+        photo_target_s = (impact_s if impact_s is not None else fallback_s) + 0.3
+        photo_at_s = min(photo_target_s, max(0.0, raw_duration_s - 0.05))
         photo_path = DATA_RAW / "sessions" / f"{slice_path.stem}_target.jpg"
         if _extract_target_photo(slice_path, photo_at_s, bbox, photo_path):
             target_photo_url = "/videos/" + photo_path.relative_to(DATA_RAW).as_posix()

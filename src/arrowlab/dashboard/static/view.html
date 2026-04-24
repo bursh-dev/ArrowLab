@@ -27,6 +27,7 @@
       <button data-tab="range">Range</button>
       <button data-tab="calibrate">Calibrate</button>
       <button data-tab="shoot">Shoot</button>
+      <button data-tab="sound">Sound</button>
       <div id="shootTabActions" class="tab-actions hidden">
         <button id="shotBtn" class="shot-btn" disabled>SHOT!</button>
         <button id="playAllBtn" disabled>▶ Play</button>
@@ -194,6 +195,16 @@
           </div>
         </aside>
       </div>
+    </section>
+
+    <!-- SOUND TAB -->
+    <section class="tab-panel" data-tab="sound">
+      <div class="sound-actions">
+        <button id="reloadSoundShotsBtn">Reload shots</button>
+        <button id="saveSoundTemplateBtn" disabled>Save template</button>
+        <span id="soundTemplateStatus" class="shoot-hint">no template yet</span>
+      </div>
+      <div id="soundShotsList" class="sound-shots-list"></div>
     </section>
 
     <details class="log-panel">
