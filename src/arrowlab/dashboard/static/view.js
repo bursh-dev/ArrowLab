@@ -457,6 +457,24 @@ function handleLiveMsg(msg) {
       setShotButton("error");
       setTimeout(() => setShotButton("idle"), 3000);
     }
+  } else if (msg.type === "sound_match_result") {
+    // Live per-candidate similarity scores. Useful for tuning the
+    // threshold during armed-mode firing — every candidate the phone
+    // sends, accepted or rejected, lands here.
+    const fmt = v => (v == null ? "-" : Number(v).toFixed(2));
+    const r = fmt(msg.release_sim);
+    const i = fmt(msg.impact_sim);
+    if (msg.accept && msg.no_template) {
+      logLive(`sound-match: no template (auto-accept)`);
+    } else if (msg.accept && msg.error) {
+      logLive(`sound-match: accept (server err=${msg.error})`);
+    } else if (msg.accept) {
+      logLive(`sound-match ACCEPT r=${r} i=${i}`, "ok");
+    } else if (msg.error) {
+      logLive(`sound-match REJECT err=${msg.error}`, "error");
+    } else {
+      logLive(`sound-match REJECT r=${r} i=${i}`);
+    }
   } else if (msg.type === "armed") {
     logLive("armed — listening for release+impact", "ok");
     setArmedUI(true);

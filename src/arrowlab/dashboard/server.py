@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 import yaml
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -407,6 +407,9 @@ async def api_session_delete_shot(n: int) -> dict:
 
 SOUND_SNIPPET_DIR = DATA_RAW / "sessions" / "sound_snippets"
 SNIPPET_DURATION_S = 0.30
+# Both release AND impact similarities must clear this for a candidate to be
+# accepted. Log-mag cosine against per-session templates.
+SOUND_MATCH_THRESHOLD = 0.80
 
 
 def _extract_snippet(src_mp4: Path, at_s: float, out_path: Path) -> None:
@@ -427,6 +430,58 @@ def _extract_snippet(src_mp4: Path, at_s: float, out_path: Path) -> None:
         ],
         check=True,
     )
+
+
+def _decode_wav_to_f32_16k(wav_path: Path):
+    """Decode any audio file to mono 16 kHz f32 PCM as a numpy array."""
+    import numpy as np
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "error", "-nostdin", "-i", str(wav_path),
+         "-f", "f32le", "-ac", "1", "-ar", "16000", "-"],
+        capture_output=True, check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    return np.frombuffer(proc.stdout, dtype=np.float32)
+
+
+def _decode_pcm_s16_to_f32_16k(pcm_bytes: bytes, src_rate: int):
+    """Resample a raw little-endian 16-bit PCM mono stream at `src_rate`
+    to 16 kHz f32 mono via ffmpeg. Used for the /api/sound-match path
+    where the phone sends raw 44.1 kHz s16le — non-integer ratio so we
+    rely on ffmpeg's resampler rather than decimating on-device."""
+    import numpy as np
+    if not pcm_bytes:
+        return None
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "error",
+         "-f", "s16le", "-ar", str(int(src_rate)), "-ac", "1", "-i", "pipe:0",
+         "-f", "f32le", "-ac", "1", "-ar", "16000", "-"],
+        input=pcm_bytes, capture_output=True, check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    return np.frombuffer(proc.stdout, dtype=np.float32)
+
+
+def _log_mag_spectrum(pcm_f32):
+    """L2-normalised log-magnitude spectrum of the first 4096 samples
+    (~256 ms at 16 kHz). Hann-windowed rfft → 2049 bins. Returns None if
+    the input is too short to carry meaningful spectral content."""
+    import numpy as np
+    if pcm_f32 is None or pcm_f32.size < 512:
+        return None
+    N = 4096
+    x = np.zeros(N, dtype=np.float32)
+    src = pcm_f32[: min(pcm_f32.size, N)]
+    x[: src.size] = src
+    x *= np.hanning(N).astype(np.float32)
+    spec = np.abs(np.fft.rfft(x))
+    log_mag = np.log1p(spec)
+    norm = float(np.linalg.norm(log_mag))
+    if norm == 0.0:
+        return None
+    return (log_mag / norm).astype(np.float32)
 
 
 @app.get("/api/calibration-sound/shots")
@@ -481,15 +536,17 @@ class SoundTemplateRequest(BaseModel):
 @app.put("/api/calibration-sound/template")
 def api_calibration_sound_template(req: SoundTemplateRequest) -> dict:
     """Compute release + impact templates by averaging the log-magnitude
-    spectra of the accepted snippets. Stored per-session in _active.json."""
+    spectra of the accepted snippets. Stored per-session in _active.json.
+    Also self-scores each accepted snippet against the final averaged
+    template so the operator can see up front whether their own
+    calibration data clears the runtime threshold."""
     import numpy as np
     s = _require_session()
     stem = s["stem"]
 
-    def _snippet_spectrum(shot: int, kind: str) -> "np.ndarray | None":
+    def _snippet_spectrum(shot: int, kind: str):
         wav = SOUND_SNIPPET_DIR / f"{stem}_shot{shot:02d}_{kind}.wav"
         if not wav.exists():
-            # Extract on demand if the UI never pre-fetched it.
             match = next((sh for sh in s.get("shots", []) or [] if int(sh.get("shot") or 0) == shot), None)
             at_s = match and match.get(f"audio_{kind}_s")
             src = DATA_RAW / "sessions" / f"{stem}_shot{shot:02d}.mp4"
@@ -499,49 +556,49 @@ def api_calibration_sound_template(req: SoundTemplateRequest) -> dict:
                 _extract_snippet(src, float(at_s), wav)
             except subprocess.CalledProcessError:
                 return None
-        # Decode wav → numpy float32 via ffmpeg (avoids pulling in wave module quirks).
-        proc = subprocess.run(
-            ["ffmpeg", "-v", "error", "-nostdin", "-i", str(wav),
-             "-f", "f32le", "-ac", "1", "-ar", "16000", "-"],
-            capture_output=True, check=False,
-        )
-        if proc.returncode != 0 or not proc.stdout:
-            return None
-        pcm = np.frombuffer(proc.stdout, dtype=np.float32)
-        # Log-magnitude spectrum of a 4096-sample (≈256 ms) window, zero-padded
-        # or cropped. Magnitudes captured in 257 bins (rfft of 512 shaped).
-        N = 4096
-        if pcm.size < 512:
-            return None
-        x = np.zeros(N, dtype=np.float32)
-        src = pcm[: min(pcm.size, N)]
-        x[: src.size] = src
-        # Hann window to reduce spectral leakage.
-        x *= np.hanning(N).astype(np.float32)
-        spec = np.abs(np.fft.rfft(x))
-        log_mag = np.log1p(spec)
-        # L2-normalise so templates are invariant to loudness.
-        norm = float(np.linalg.norm(log_mag))
-        if norm == 0.0:
-            return None
-        return (log_mag / norm).astype(np.float32)
+        pcm = _decode_wav_to_f32_16k(wav)
+        return _log_mag_spectrum(pcm)
 
-    def _average(shots: list[int], kind: str) -> list[float] | None:
-        specs = [s for s in (_snippet_spectrum(sh, kind) for sh in shots) if s is not None]
-        if not specs:
+    def _gather(shots: list[int], kind: str):
+        tagged: list[tuple[int, "np.ndarray"]] = []
+        for sh in shots:
+            sp = _snippet_spectrum(sh, kind)
+            if sp is not None:
+                tagged.append((sh, sp))
+        return tagged
+
+    def _average(tagged):
+        if not tagged:
             return None
-        mean = np.mean(np.stack(specs), axis=0)
+        stack = np.stack([sp for _, sp in tagged])
+        mean = np.mean(stack, axis=0)
         mean = mean / max(float(np.linalg.norm(mean)), 1e-12)
-        return mean.tolist()
+        return mean.astype(np.float32)
 
-    release_template = _average(req.accepted_release_shots, "release")
-    impact_template = _average(req.accepted_impact_shots, "impact")
+    def _self_scores(template, tagged):
+        if template is None or not tagged:
+            return None
+        sims = {sh: float(np.dot(template, sp)) for sh, sp in tagged}
+        vals = list(sims.values())
+        return {
+            "min": round(min(vals), 4),
+            "max": round(max(vals), 4),
+            "mean": round(sum(vals) / len(vals), 4),
+            "per_shot": {str(sh): round(v, 4) for sh, v in sims.items()},
+            "threshold": SOUND_MATCH_THRESHOLD,
+            "below_threshold_count": sum(1 for v in vals if v < SOUND_MATCH_THRESHOLD),
+        }
+
+    release_tagged = _gather(req.accepted_release_shots, "release")
+    impact_tagged = _gather(req.accepted_impact_shots, "impact")
+    release_template = _average(release_tagged)
+    impact_template = _average(impact_tagged)
     if release_template is None or impact_template is None:
         raise HTTPException(400, "need at least one accepted snippet of each kind")
 
     s["sound_template"] = {
-        "release": release_template,
-        "impact": impact_template,
+        "release": release_template.tolist(),
+        "impact": impact_template.tolist(),
         "release_count": len(req.accepted_release_shots),
         "impact_count": len(req.accepted_impact_shots),
     }
@@ -550,8 +607,98 @@ def api_calibration_sound_template(req: SoundTemplateRequest) -> dict:
         "ok": True,
         "release_count": len(req.accepted_release_shots),
         "impact_count": len(req.accepted_impact_shots),
-        "template_bins": len(release_template),
+        "template_bins": int(release_template.size),
+        "release_self_scores": _self_scores(release_template, release_tagged),
+        "impact_self_scores": _self_scores(impact_template, impact_tagged),
     }
+
+
+@app.post("/api/sound-match")
+async def api_sound_match(
+    release: UploadFile = File(...),
+    impact: UploadFile = File(...),
+    src_rate: int = Form(44100),
+) -> dict:
+    """Armed-mode pre-filter. Phone uploads two 300 ms raw little-endian
+    16-bit PCM mono snippets (at `src_rate`, default 44.1 kHz) centred on
+    its on-device release + impact peak picks. Server resamples to 16 kHz,
+    computes the same Hann-windowed log-mag spectrum the calibration
+    endpoint uses, cosine-compares to the stored per-session templates.
+
+    Accept requires BOTH sims ≥ SOUND_MATCH_THRESHOLD — a cough that
+    happens to resemble an impact alone should not trigger a shot.
+
+    Returns {accept, release_sim, impact_sim, threshold}. Special cases:
+      - no template stored: accept=true with no_template=true (so armed
+        mode keeps working pre-calibration; the operator is expected to
+        calibrate before relying on runtime rejection).
+      - snippet fails to decode / too short: accept=false with an
+        `error` field — explicit so the phone logs the failure rather
+        than silently accepting garbage.
+    """
+    import numpy as np
+    s = _require_session()
+    template = s.get("sound_template")
+
+    release_bytes = await release.read()
+    impact_bytes = await impact.read()
+
+    if not template:
+        result = {
+            "accept": True,
+            "no_template": True,
+            "release_sim": None,
+            "impact_sim": None,
+            "threshold": SOUND_MATCH_THRESHOLD,
+            "release_bytes": len(release_bytes),
+            "impact_bytes": len(impact_bytes),
+        }
+        await _broadcast_view({"type": "sound_match_result", **result})
+        return result
+
+    def _score() -> dict:
+        rel_pcm = _decode_pcm_s16_to_f32_16k(release_bytes, src_rate)
+        imp_pcm = _decode_pcm_s16_to_f32_16k(impact_bytes, src_rate)
+        if rel_pcm is None or imp_pcm is None:
+            return {
+                "accept": False, "error": "decode_failed",
+                "release_sim": None, "impact_sim": None,
+                "threshold": SOUND_MATCH_THRESHOLD,
+            }
+        rel_spec = _log_mag_spectrum(rel_pcm)
+        imp_spec = _log_mag_spectrum(imp_pcm)
+        if rel_spec is None or imp_spec is None:
+            return {
+                "accept": False, "error": "spectrum_failed",
+                "release_sim": None, "impact_sim": None,
+                "threshold": SOUND_MATCH_THRESHOLD,
+            }
+        rel_t = np.asarray(template["release"], dtype=np.float32)
+        imp_t = np.asarray(template["impact"], dtype=np.float32)
+        if rel_spec.shape != rel_t.shape or imp_spec.shape != imp_t.shape:
+            return {
+                "accept": False, "error": "shape_mismatch",
+                "release_sim": None, "impact_sim": None,
+                "threshold": SOUND_MATCH_THRESHOLD,
+            }
+        release_sim = float(np.dot(rel_spec, rel_t))
+        impact_sim = float(np.dot(imp_spec, imp_t))
+        accept = (
+            release_sim >= SOUND_MATCH_THRESHOLD
+            and impact_sim >= SOUND_MATCH_THRESHOLD
+        )
+        return {
+            "accept": accept,
+            "release_sim": round(release_sim, 4),
+            "impact_sim": round(impact_sim, 4),
+            "threshold": SOUND_MATCH_THRESHOLD,
+        }
+
+    result = await run_in_threadpool(_score)
+    result["release_bytes"] = len(release_bytes)
+    result["impact_bytes"] = len(impact_bytes)
+    await _broadcast_view({"type": "sound_match_result", **result})
+    return result
 
 
 @app.put("/api/session/annotation")
@@ -782,8 +929,34 @@ async def api_calibration_frame(request: Request) -> dict:
         finally:
             mp4_path.unlink(missing_ok=True)
     else:
-        # Fake-phone path: direct JPEG upload.
-        out.write_bytes(data)
+        # JPEG path. Phone sends `X-Image-Rotate-Cw` to undo the display
+        # matrix that TextureView.getBitmap baked into the bitmap, so the
+        # saved frame ends up sensor-native (matching the encoder's mp4
+        # frames the tracker consumes). fake_phone doesn't set the header
+        # — its source-extracted JPEGs are already sensor-native.
+        rotate_cw = 0
+        rotate_hdr = request.headers.get("x-image-rotate-cw")
+        if rotate_hdr:
+            try:
+                rotate_cw = int(rotate_hdr) % 360
+            except ValueError:
+                rotate_cw = 0
+        if rotate_cw == 0:
+            out.write_bytes(data)
+        else:
+            import cv2
+            import numpy as np
+            arr = np.frombuffer(data, dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is None:
+                raise HTTPException(400, "could not decode JPEG body")
+            if rotate_cw == 90:
+                img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+            elif rotate_cw == 180:
+                img = cv2.rotate(img, cv2.ROTATE_180)
+            elif rotate_cw == 270:
+                img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            cv2.imwrite(str(out), img)
     url = "/videos/" + out.relative_to(DATA_RAW).as_posix()
     s["calibration_frame"] = url
     _persist_session()
@@ -922,6 +1095,14 @@ async def api_shot(request: Request) -> dict:
         "release_s": _float_header("X-Arrow-Release-S"),
         "impact_s": _float_header("X-Arrow-Impact-S"),
     } if request.headers.get("X-Arrow-Release-S") or request.headers.get("X-Arrow-Impact-S") else None
+    # Phone records the pre-filter similarity scores for each accepted
+    # candidate so we can audit marginal accepts after the fact.
+    rel_sim = _float_header("X-Arrow-Release-Sim")
+    imp_sim = _float_header("X-Arrow-Impact-Sim")
+    provided_sound_match = {
+        "release_sim": rel_sim,
+        "impact_sim": imp_sim,
+    } if rel_sim is not None or imp_sim is not None else None
 
     clip_url = "/videos/" + slice_path.relative_to(DATA_RAW).as_posix()
     await _broadcast_view({
@@ -930,7 +1111,11 @@ async def api_shot(request: Request) -> dict:
         "bytes": len(data),
         "clip_url": clip_url,
     })
-    asyncio.create_task(_process_shot(slice_path, n, s, provided_events=provided_events))
+    asyncio.create_task(_process_shot(
+        slice_path, n, s,
+        provided_events=provided_events,
+        provided_sound_match=provided_sound_match,
+    ))
     return {"ok": True, "shot_id": n, "clip_url": clip_url}
 
 
@@ -939,6 +1124,7 @@ async def _process_shot(
     n: int,
     session: dict,
     provided_events: dict | None = None,
+    provided_sound_match: dict | None = None,
 ) -> None:
     import time as _time
     t_pipeline_start = _time.perf_counter()
@@ -1119,6 +1305,7 @@ async def _process_shot(
             "audio_impact_s": audio_events.get("impact_s"),
             "speed_audio_ms": speed_audio_ms,
             "target_photo_url": target_photo_url,
+            "sound_match": provided_sound_match,
         }
 
     try:
