@@ -306,71 +306,167 @@ def track_clip(
     """
     import time as _t
     _t0 = _t.perf_counter()
-    if frames is None:
-        frames = read_all_frames(clip_path)
-    _t_decode = _t.perf_counter()
-    if not frames:
-        raise RuntimeError(f"no frames read from {clip_path}")
+    # Streaming mode (frames=None): read clip twice with cv2.VideoCapture so
+    # we never hold all decoded frames in memory at once. Caller's old
+    # contract of passing frames= is still honored when provided (auto_flight
+    # path) but the server's hot path no longer uses it.
+    streaming = frames is None
     if fps is None:
         fps = probe_fps(clip_path)
-    if clip_end_frame is None:
-        clip_end_frame = clip_start_frame + len(frames) - 1
-    h, w = frames[0].shape[:2]
-    if output_stem is None:
-        output_stem = clip_path.stem
 
-    pre_count = max(1, fw_start - clip_start_frame)
-    bg_pool = frames[: min(pre_count, len(frames))]
-    if len(bg_pool) < 3:
-        bg_pool = frames
-    # Subsample to ~15 evenly spaced frames before np.median — stacking hundreds
-    # of 1920x1080 frames burns gigabytes of RAM and seconds of CPU.
-    stride = max(1, len(bg_pool) // 15)
-    bg_samples = bg_pool[::stride][:15]
-    bg_gray = cv2.cvtColor(
-        np.median(np.stack(bg_samples), axis=0).astype(np.uint8),
-        cv2.COLOR_BGR2GRAY,
-    )
+    if streaming:
+        # Pass 1: bg_samples + detections in a single cap traversal.
+        cap1 = cv2.VideoCapture(str(clip_path))
+        if not cap1.isOpened():
+            raise RuntimeError(f"could not open {clip_path}")
+        total_frames = int(cap1.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            # Some VFR / problematic mp4s report 0; fall back to reading.
+            cap1.release()
+            frames_fallback = read_all_frames(clip_path)
+            if not frames_fallback:
+                raise RuntimeError(f"no frames read from {clip_path}")
+            frames = frames_fallback
+            streaming = False
+        else:
+            if clip_end_frame is None:
+                clip_end_frame = clip_start_frame + total_frames - 1
+            h = int(cap1.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            w = int(cap1.get(cv2.CAP_PROP_FRAME_WIDTH))
+            if output_stem is None:
+                output_stem = clip_path.stem
+            pre_count = max(1, fw_start - clip_start_frame)
+            # Number of frames we draw bg samples from. Mirrors the old
+            # `bg_pool = frames[:pre_count]; if len < 3: bg_pool = frames`.
+            bg_total = pre_count if pre_count >= 3 else total_frames
+            bg_stride = max(1, bg_total // 15)
 
-    roi_mask = build_roi_mask((h, w), annotation)
-    target = annotation.get("target") or {}
-    target_cx = target.get("cx")
+            roi_mask = build_roi_mask((h, w), annotation)
+            target = annotation.get("target") or {}
+            target_cx = target.get("cx")
 
-    if auto_flight:
-        auto = auto_detect_flight(frames, bg_gray, roi_mask, diff_threshold=diff_threshold)
-        if auto is None:
-            raise RuntimeError(f"auto-flight failed on {log_prefix}")
-        si, _ei = auto
-        fw_start = clip_start_frame + max(0, si - 2)
-        fw_end = clip_end_frame
+            bg_samples: list = []
+            detections: list[dict] = []
+            bg_gray = None  # computed lazily once we have enough samples
+            i = 0
+            while True:
+                ok, f = cap1.read()
+                if not ok:
+                    break
+                global_frame = clip_start_frame + i
 
-    detections: list[dict] = []
-    for i, f in enumerate(frames):
-        global_frame = clip_start_frame + i
-        if not (fw_start <= global_frame <= fw_end):
-            continue
-        gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
-        result = detect_arrow(gray, bg_gray, roi_mask, diff_threshold, min_area, target_cx)
-        if result is None:
-            continue
-        tip = result["tip"]
-        tail = result["tail"]
-        bx, by, bw, bh = result["bbox"]
-        detections.append({
-            "frame": global_frame,
-            "x": int(tip[0]),
-            "y": int(tip[1]),
-            "tail_x": int(tail[0]),
-            "tail_y": int(tail[1]),
-            "bbox": [int(bx), int(by), int(bw), int(bh)],
-            "length": float(result["length"]),
-            "angle": float(result["angle"]),
-            "hough": bool(result["hough"]),
-        })
+                # Collect bg samples from the bg_total-frame window.
+                if i < bg_total and (i % bg_stride == 0) and len(bg_samples) < 15:
+                    bg_samples.append(f.copy())
 
-    raw_count = len(detections)
-    cleaned = clean_trajectory(detections)
-    _t_detect = _t.perf_counter()
+                # Detection runs only inside the flight window.
+                if fw_start <= global_frame <= fw_end:
+                    if bg_gray is None:
+                        if len(bg_samples) < 1:
+                            # Pathological case: flight window starts at frame 0
+                            # and we collected no pre-flight bg. Use this frame
+                            # as the bg reference (will yield empty detections,
+                            # but at least it doesn't crash).
+                            bg_samples.append(f.copy())
+                        bg_gray = cv2.cvtColor(
+                            np.median(np.stack(bg_samples), axis=0).astype(np.uint8),
+                            cv2.COLOR_BGR2GRAY,
+                        )
+                        bg_samples = []  # release ~90 MB
+                    gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+                    result = detect_arrow(gray, bg_gray, roi_mask, diff_threshold, min_area, target_cx)
+                    if result is not None:
+                        tip = result["tip"]
+                        tail = result["tail"]
+                        bx, by, bw, bh = result["bbox"]
+                        detections.append({
+                            "frame": global_frame,
+                            "x": int(tip[0]),
+                            "y": int(tip[1]),
+                            "tail_x": int(tail[0]),
+                            "tail_y": int(tail[1]),
+                            "bbox": [int(bx), int(by), int(bw), int(bh)],
+                            "length": float(result["length"]),
+                            "angle": float(result["angle"]),
+                            "hough": bool(result["hough"]),
+                        })
+                i += 1
+            cap1.release()
+            if bg_gray is None:
+                # Detection window never opened (no frames overlap [fw_start,fw_end]).
+                # Build a bg from whatever we collected so the write loop still works.
+                if not bg_samples:
+                    raise RuntimeError(f"no frames read from {clip_path}")
+                bg_gray = cv2.cvtColor(
+                    np.median(np.stack(bg_samples), axis=0).astype(np.uint8),
+                    cv2.COLOR_BGR2GRAY,
+                )
+                bg_samples = []
+            raw_count = len(detections)
+            cleaned = clean_trajectory(detections)
+            _t_decode = _t0  # decode time folded into detect for streaming
+            _t_detect = _t.perf_counter()
+    if not streaming:
+        # Legacy in-memory path (frames pre-decoded by caller, e.g. auto_flight).
+        _t_decode = _t.perf_counter()
+        if not frames:
+            raise RuntimeError(f"no frames read from {clip_path}")
+        if clip_end_frame is None:
+            clip_end_frame = clip_start_frame + len(frames) - 1
+        h, w = frames[0].shape[:2]
+        if output_stem is None:
+            output_stem = clip_path.stem
+
+        pre_count = max(1, fw_start - clip_start_frame)
+        bg_pool = frames[: min(pre_count, len(frames))]
+        if len(bg_pool) < 3:
+            bg_pool = frames
+        stride = max(1, len(bg_pool) // 15)
+        bg_samples = bg_pool[::stride][:15]
+        bg_gray = cv2.cvtColor(
+            np.median(np.stack(bg_samples), axis=0).astype(np.uint8),
+            cv2.COLOR_BGR2GRAY,
+        )
+
+        roi_mask = build_roi_mask((h, w), annotation)
+        target = annotation.get("target") or {}
+        target_cx = target.get("cx")
+
+        if auto_flight:
+            auto = auto_detect_flight(frames, bg_gray, roi_mask, diff_threshold=diff_threshold)
+            if auto is None:
+                raise RuntimeError(f"auto-flight failed on {log_prefix}")
+            si, _ei = auto
+            fw_start = clip_start_frame + max(0, si - 2)
+            fw_end = clip_end_frame
+
+        detections: list[dict] = []
+        for i, f in enumerate(frames):
+            global_frame = clip_start_frame + i
+            if not (fw_start <= global_frame <= fw_end):
+                continue
+            gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+            result = detect_arrow(gray, bg_gray, roi_mask, diff_threshold, min_area, target_cx)
+            if result is None:
+                continue
+            tip = result["tip"]
+            tail = result["tail"]
+            bx, by, bw, bh = result["bbox"]
+            detections.append({
+                "frame": global_frame,
+                "x": int(tip[0]),
+                "y": int(tip[1]),
+                "tail_x": int(tail[0]),
+                "tail_y": int(tail[1]),
+                "bbox": [int(bx), int(by), int(bw), int(bh)],
+                "length": float(result["length"]),
+                "angle": float(result["angle"]),
+                "hough": bool(result["hough"]),
+            })
+
+        raw_count = len(detections)
+        cleaned = clean_trajectory(detections)
+        _t_detect = _t.perf_counter()
 
     TRACKED_DIR.mkdir(parents=True, exist_ok=True)
     tracked_path = TRACKED_DIR / f"{output_stem}_tracked.mp4"
@@ -399,10 +495,8 @@ def track_clip(
     write_last_frame = min(clip_end_frame, fw_end + write_post_pad_frames)
 
     corridor = annotation.get("corridor")
-    for i, f in enumerate(frames):
-        global_frame = clip_start_frame + i
-        if global_frame < write_first_frame or global_frame > write_last_frame:
-            continue
+
+    def _render_and_write(f, global_frame):
         vis = f.copy()
         if corridor:
             cv2.line(vis, (0, corridor["y_top"]), (w, corridor["y_top"]), (200, 200, 0), 1)
@@ -433,6 +527,30 @@ def track_clip(
         if scale != 1.0:
             vis = cv2.resize(vis, (out_w, out_h), interpolation=cv2.INTER_AREA)
         writer.write(vis)
+
+    if streaming:
+        # Pass 2: re-open the cap and stream just the write window.
+        cap2 = cv2.VideoCapture(str(clip_path))
+        if not cap2.isOpened():
+            raise RuntimeError(f"could not re-open {clip_path}")
+        i = 0
+        while True:
+            ok, f = cap2.read()
+            if not ok:
+                break
+            global_frame = clip_start_frame + i
+            if global_frame > write_last_frame:
+                break
+            if global_frame >= write_first_frame:
+                _render_and_write(f, global_frame)
+            i += 1
+        cap2.release()
+    else:
+        for i, f in enumerate(frames):
+            global_frame = clip_start_frame + i
+            if global_frame < write_first_frame or global_frame > write_last_frame:
+                continue
+            _render_and_write(f, global_frame)
     writer.release()
     _t_write = _t.perf_counter()
     from arrowlab.video.encode import to_h264_faststart

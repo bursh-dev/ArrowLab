@@ -1140,18 +1140,21 @@ async def _process_shot(
         from arrowlab.video.track import build_roi_mask, probe_fps, track_clip
 
         t_start = time.perf_counter()
-        cap = cv2.VideoCapture(str(slice_path))
-        frames: list = []
-        while True:
-            ok, f = cap.read()
-            if not ok:
-                break
-            frames.append(f)
-        cap.release()
-        t_decoded = time.perf_counter()
-        if not frames:
+        # Probe metadata without decoding all frames. Holding the full frame
+        # list in memory peaks at ~6 MB × frame_count (e.g. ~7 GB for a 5 s
+        # 240 fps clip) and OOMs on 8 GB hosts. We only fall back to that
+        # path when the motion detector is needed (no audio events from
+        # phone) — the armed-mode hot path stays streaming.
+        cap_probe = cv2.VideoCapture(str(slice_path))
+        if not cap_probe.isOpened():
             return None
-        h, w = frames[0].shape[:2]
+        w = int(cap_probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap_probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap_probe.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap_probe.release()
+        if w <= 0 or h <= 0:
+            return None
+        t_decoded = time.perf_counter()
 
         # Audio onset detection. If the phone already ran its own detector
         # (armed mode) and sent timestamps, trust those and skip the server
@@ -1169,6 +1172,10 @@ async def _process_shot(
         a: int | None = None
         b: int | None = None
         flight_source = "none"
+        # `frames` is only populated when motion fallback is needed (rare —
+        # phone armed mode always provides audio events). Streaming path
+        # leaves it None and lets track_clip read the cap itself.
+        frames: list | None = None
         if (
             audio_events.get("release_s") is not None
             and audio_events.get("impact_s") is not None
@@ -1177,10 +1184,23 @@ async def _process_shot(
             b_guess = int(round(audio_events["impact_s"] * fps_probe))
             # 2-frame pad each side covers audio/video alignment jitter.
             a = max(0, a_guess - 2)
-            b = min(len(frames) - 1, b_guess + 2)
+            b = min(max(total_frames, 1) - 1, b_guess + 2)
             if b > a:
                 flight_source = "audio"
         if flight_source == "none":
+            # Motion fallback needs every frame in memory. Decode now.
+            cap = cv2.VideoCapture(str(slice_path))
+            frames = []
+            while True:
+                ok, f = cap.read()
+                if not ok:
+                    break
+                frames.append(f)
+            cap.release()
+            if not frames:
+                return None
+            if total_frames <= 0:
+                total_frames = len(frames)
             roi = build_roi_mask((h, w), annotation)
             detected = auto_detect_flight_in_clip(frames, roi)
             if detected is None:
@@ -1191,7 +1211,7 @@ async def _process_shot(
         t_detected = time.perf_counter()
         traj_path = track_clip(
             slice_path, annotation, a + 1, b + 1,
-            clip_start_frame=1, clip_end_frame=len(frames),
+            clip_start_frame=1, clip_end_frame=max(total_frames, 1),
             output_stem=slice_path.stem,
             video_label=f"live shot {n}",
             shot_index=n - 1,
@@ -1248,11 +1268,35 @@ async def _process_shot(
             (raw_out_w, raw_out_h),
         )
         try:
-            for i in range(tfirst - 1, min(tlast, len(frames))):
-                f = frames[i]
-                if raw_scale != 1.0:
-                    f = cv2.resize(f, (raw_out_w, raw_out_h), interpolation=cv2.INTER_AREA)
-                raw_writer.write(f)
+            if frames is not None:
+                for i in range(tfirst - 1, min(tlast, len(frames))):
+                    f = frames[i]
+                    if raw_scale != 1.0:
+                        f = cv2.resize(f, (raw_out_w, raw_out_h), interpolation=cv2.INTER_AREA)
+                    raw_writer.write(f)
+            else:
+                # Streaming path: re-open the cap and write only the
+                # [tfirst-1 .. tlast-1] window. cap.set(POS_FRAMES) is
+                # unreliable on H.264 inter-frame video, so we just stream
+                # forward and skip until we reach tfirst-1.
+                cap_trim = cv2.VideoCapture(str(slice_path))
+                try:
+                    pos = 0
+                    while pos < tfirst - 1:
+                        ok, _ = cap_trim.read()
+                        if not ok:
+                            break
+                        pos += 1
+                    while pos < tlast:
+                        ok, f = cap_trim.read()
+                        if not ok:
+                            break
+                        if raw_scale != 1.0:
+                            f = cv2.resize(f, (raw_out_w, raw_out_h), interpolation=cv2.INTER_AREA)
+                        raw_writer.write(f)
+                        pos += 1
+                finally:
+                    cap_trim.release()
         finally:
             raw_writer.release()
         to_h264_faststart(clip_trim)
