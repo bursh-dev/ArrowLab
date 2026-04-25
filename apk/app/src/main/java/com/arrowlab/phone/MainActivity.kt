@@ -26,6 +26,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -39,6 +40,20 @@ import java.util.Date
 import java.util.concurrent.TimeUnit
 
 private const val SERVER_PORT = 8000
+
+/** Cloudflare quick-tunnel URL. When non-null, the APK skips LAN discovery
+ *  and routes every request (HTTP + WS) through this base. The tunnel lets
+ *  the phone reach the laptop server from any network without USB tether
+ *  or being on the same Wi-Fi. Set to null to fall back to LAN discovery. */
+// Top-level `val` (not `const val`) because Kotlin disallows nullable
+// const declarations. Functionally equivalent for our use.
+//
+// Currently null: trycloudflare quick tunnels add ~30 s of latency on a
+// 200 KB calibration upload, which makes session setup painful. Phone
+// stays on the LAN-discovery path (USB tether at 127.0.0.1 first, then
+// last-known host, then /24 scan). Re-enable with the URL string once
+// we move to a stable Cloudflare named tunnel.
+private val REMOTE_BASE_URL: String? = null
 
 class MainActivity : AppCompatActivity() {
 
@@ -72,7 +87,9 @@ class MainActivity : AppCompatActivity() {
     private val reconnectHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var reconnectRunnable: Runnable? = null
     private var connectEpoch = 0L
-    private var currentHost: String? = null
+    /** Full base URL for all requests, including scheme/host/port — e.g.
+     *  "http://192.168.1.5:8000" or "https://foo.trycloudflare.com". */
+    private var currentBaseUrl: String? = null
 
     private var cameraController: CameraController? = null
 
@@ -170,8 +187,19 @@ class MainActivity : AppCompatActivity() {
         reconnectDelayMs = 1_000L
         connectBtn.isEnabled = false
         disconnectBtn.isEnabled = true
-        setStatus("discovering...", "#b0b050")
 
+        // Remote-tunnel override: when set, skip LAN discovery and connect
+        // straight to the Cloudflare URL. The discovery/probe/last_host
+        // machinery stays intact for the null-override fallback case.
+        if (REMOTE_BASE_URL != null) {
+            currentBaseUrl = REMOTE_BASE_URL
+            appendLog("using remote URL $REMOTE_BASE_URL", ok = true)
+            setStatus("connecting (remote)...", "#b0b050")
+            connect(REMOTE_BASE_URL)
+            return
+        }
+
+        setStatus("discovering...", "#b0b050")
         scope.launch {
             val host = discoverServer(SERVER_PORT)
             if (host == null) {
@@ -182,9 +210,9 @@ class MainActivity : AppCompatActivity() {
                 return@launch
             }
             appendLog("discovery: found server at $host:$SERVER_PORT", ok = true)
-            currentHost = host
+            currentBaseUrl = "http://$host:$SERVER_PORT"
             if (host != "127.0.0.1") rememberHost(host)
-            connect(host, SERVER_PORT)
+            connect(currentBaseUrl!!)
         }
     }
 
@@ -256,9 +284,11 @@ class MainActivity : AppCompatActivity() {
         return prefixes
     }
 
-    private fun connect(host: String, port: Int) {
+    private fun connect(baseUrl: String) {
         val epoch = ++connectEpoch
-        val url = "ws://$host:$port/ws/phone"
+        // http(s):// → ws(s):// for the WebSocket. OkHttp handles WSS over
+        // Cloudflare Tunnel without any extra builder config.
+        val url = baseUrl.replaceFirst("http", "ws") + "/ws/phone"
         appendLog("connecting to $url")
         setStatus("connecting...", "#b0b050")
 
@@ -294,7 +324,7 @@ class MainActivity : AppCompatActivity() {
                     setStatus("disconnected", "#888888")
                     disconnectBtn.isEnabled = false
                     connectBtn.isEnabled = true
-                    scheduleReconnectIfNeeded(host, port, epoch)
+                    scheduleReconnectIfNeeded(baseUrl, epoch)
                 }
             }
 
@@ -305,7 +335,7 @@ class MainActivity : AppCompatActivity() {
                     setStatus("error", "#d05050")
                     disconnectBtn.isEnabled = false
                     connectBtn.isEnabled = true
-                    scheduleReconnectIfNeeded(host, port, epoch)
+                    scheduleReconnectIfNeeded(baseUrl, epoch)
                 }
             }
         })
@@ -316,7 +346,7 @@ class MainActivity : AppCompatActivity() {
         reconnectRunnable = null
     }
 
-    private fun scheduleReconnectIfNeeded(host: String, port: Int, epoch: Long) {
+    private fun scheduleReconnectIfNeeded(baseUrl: String, epoch: Long) {
         if (userRequestedDisconnect) return
         if (epoch != connectEpoch) return
         cancelPendingReconnect()
@@ -326,7 +356,7 @@ class MainActivity : AppCompatActivity() {
             if (epoch != connectEpoch) return@Runnable
             val next = (reconnectDelayMs * 2).coerceAtMost(15_000)
             reconnectDelayMs = next
-            connect(host, port)
+            connect(baseUrl)
         }
         reconnectRunnable = r
         reconnectHandler.postDelayed(r, reconnectDelayMs)
@@ -347,17 +377,26 @@ class MainActivity : AppCompatActivity() {
                 userRequestedDisconnect = true
             }
             "capture_frame" -> {
-                appendLog("capture_frame received, slicing 1s for calibration...")
-                cameraController?.sliceLastSeconds(1.0) { bytes ->
+                // Direct JPEG (~150 KB) from the TextureView. Previously we
+                // shipped a 1 s mp4 slice and let the server extract a frame,
+                // but that's ~2 MB and 524s through the Cloudflare quick
+                // tunnel. JPEG is small enough to clear the tunnel cleanly
+                // and the server's calibration endpoint already handles
+                // image/jpeg directly (the fake-phone path).
+                appendLog("capture_frame received, grabbing JPEG...")
+                val cc = cameraController
+                if (cc == null) {
+                    appendLog("camera not ready", error = true)
+                } else cc.captureStillJpeg { bytes ->
                     runOnUiThread {
                         if (bytes == null) {
-                            appendLog("calibration slice failed", error = true)
+                            appendLog("calibration jpeg capture failed", error = true)
                         } else {
-                            appendLog("sliced ${bytes.size / 1024} KB, uploading...")
+                            appendLog("captured ${bytes.size / 1024} KB JPEG, uploading...")
                             uploadCalibrationFrame(bytes)
                         }
                     }
-                } ?: appendLog("camera not ready", error = true)
+                }
             }
             "annotation" -> {
                 val corridor = msg.optJSONObject("corridor")
@@ -400,7 +439,10 @@ class MainActivity : AppCompatActivity() {
                 } ?: appendLog("camera not ready for slice", error = true)
             }
             "arm" -> {
-                val ok = cameraController?.arm { bytes, releasePtsUs, impactPtsUs, videoDurationS ->
+                val checker = ShotRecorder.MatchChecker { rPcm, iPcm, sr ->
+                    checkSoundMatch(rPcm, iPcm, sr)
+                }
+                val ok = cameraController?.arm(checker) { bytes, releasePtsUs, impactPtsUs, videoDurationS, releaseSim, impactSim ->
                     // Audio is synced to the video's actual duration in the
                     // mp4 (both tracks end at "now"), and the trigger pool
                     // sleeps `postPadS` after impact before cutting. So:
@@ -411,12 +453,17 @@ class MainActivity : AppCompatActivity() {
                     val impactInMp4S = videoDurationS - postPadS
                     val releaseInMp4S = impactInMp4S - gapS
                     runOnUiThread {
+                        val simStr = "r=${releaseSim?.let { "%.2f".format(it) } ?: "-"}/i=${impactSim?.let { "%.2f".format(it) } ?: "-"}"
                         appendLog(
-                            "armed-shot: ${bytes.size / 1024} KB gap=${(gapS * 1000).toInt()} ms dur=${"%.2f".format(videoDurationS)}s, uploading...",
+                            "armed-shot: ${bytes.size / 1024} KB gap=${(gapS * 1000).toInt()} ms dur=${"%.2f".format(videoDurationS)}s sims=$simStr, uploading...",
                             ok = true,
                         )
                     }
-                    uploadShot(bytes, releaseS = releaseInMp4S, impactS = impactInMp4S)
+                    uploadShot(
+                        bytes,
+                        releaseS = releaseInMp4S, impactS = impactInMp4S,
+                        releaseSim = releaseSim, impactSim = impactSim,
+                    )
                 } == true
                 if (!ok) appendLog("arm failed — camera not ready", error = true)
             }
@@ -427,12 +474,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun uploadCalibrationFrame(bytes: ByteArray) {
-        val host = currentHost ?: return
+        val baseUrl = currentBaseUrl ?: return
+        // No rotation header: captureStillJpeg now extracts the JPEG from
+        // an encoder mp4 frame, which is already in the same sensor-native
+        // orientation as the shot mp4s the tracker consumes.
         scope.launch(Dispatchers.IO) {
             try {
-                val body = bytes.toRequestBody("video/mp4".toMediaType())
+                val body = bytes.toRequestBody("image/jpeg".toMediaType())
                 val req = Request.Builder()
-                    .url("http://$host:$SERVER_PORT/api/calibration-frame")
+                    .url("$baseUrl/api/calibration-frame")
                     .post(body)
                     .build()
                 http.newCall(req).execute().use { resp ->
@@ -450,16 +500,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun uploadShot(bytes: ByteArray, releaseS: Double? = null, impactS: Double? = null) {
-        val host = currentHost ?: return
+    private fun uploadShot(
+        bytes: ByteArray,
+        releaseS: Double? = null,
+        impactS: Double? = null,
+        releaseSim: Double? = null,
+        impactSim: Double? = null,
+    ) {
+        val baseUrl = currentBaseUrl ?: return
         scope.launch(Dispatchers.IO) {
             try {
                 val body = bytes.toRequestBody("video/mp4".toMediaType())
                 val builder = Request.Builder()
-                    .url("http://$host:$SERVER_PORT/api/shot")
+                    .url("$baseUrl/api/shot")
                     .post(body)
                 if (releaseS != null) builder.addHeader("X-Arrow-Release-S", "%.6f".format(releaseS))
                 if (impactS != null) builder.addHeader("X-Arrow-Impact-S", "%.6f".format(impactS))
+                if (releaseSim != null) builder.addHeader("X-Arrow-Release-Sim", "%.6f".format(releaseSim))
+                if (impactSim != null) builder.addHeader("X-Arrow-Impact-Sim", "%.6f".format(impactSim))
                 http.newCall(builder.build()).execute().use { resp ->
                     runOnUiThread {
                         if (resp.isSuccessful) {
@@ -472,6 +530,48 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 runOnUiThread { appendLog("shot upload error: ${e.message}", error = true) }
             }
+        }
+    }
+
+    /** Synchronous probe to /api/sound-match. Called from the trigger-pool
+     *  thread inside ShotRecorder; OkHttp's blocking execute() is fine.
+     *  On any HTTP/transport failure we return accept=true so a flaky
+     *  network doesn't drop real shots — explicit error is logged. */
+    private fun checkSoundMatch(
+        releasePcm: ByteArray, impactPcm: ByteArray, sampleRate: Int,
+    ): ShotRecorder.MatchResult {
+        val baseUrl = currentBaseUrl
+            ?: return ShotRecorder.MatchResult(accept = true, error = "no_host")
+        return try {
+            val pcmType = "application/octet-stream".toMediaType()
+            val body = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("release", "release.pcm", releasePcm.toRequestBody(pcmType))
+                .addFormDataPart("impact", "impact.pcm", impactPcm.toRequestBody(pcmType))
+                .addFormDataPart("src_rate", sampleRate.toString())
+                .build()
+            val req = Request.Builder()
+                .url("$baseUrl/api/sound-match")
+                .post(body)
+                .build()
+            http.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    return ShotRecorder.MatchResult(
+                        accept = true, error = "http_${resp.code}",
+                    )
+                }
+                val text = resp.body?.string().orEmpty()
+                val json = JSONObject(text)
+                ShotRecorder.MatchResult(
+                    accept = json.optBoolean("accept", true),
+                    releaseSim = if (json.isNull("release_sim")) null else json.optDouble("release_sim"),
+                    impactSim = if (json.isNull("impact_sim")) null else json.optDouble("impact_sim"),
+                    noTemplate = json.optBoolean("no_template", false),
+                    error = if (json.isNull("error")) null else json.optString("error").ifEmpty { null },
+                )
+            }
+        } catch (e: Exception) {
+            ShotRecorder.MatchResult(accept = true, error = e.message ?: "exception")
         }
     }
 

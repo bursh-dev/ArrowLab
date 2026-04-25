@@ -18,6 +18,7 @@ import android.hardware.camera2.CaptureRequest
 import android.media.MediaCodec
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Range
@@ -59,6 +60,8 @@ class CameraController(
     private var started = false
 
     fun getStillSize(): Size = previewSize
+
+    fun getSensorOrientation(): Int = sensorOrientation
 
     fun start() {
         if (started) return
@@ -268,23 +271,56 @@ class CameraController(
     }
 
     fun captureStillJpeg(onDone: (ByteArray?) -> Unit) {
+        // Pull a single frame from the encoder ring buffer (the same source
+        // the shot mp4s come from), JPEG-compress it, and return that.
+        // This guarantees the calibration JPEG is byte-for-byte identical
+        // in resolution + orientation to what the tracker later consumes
+        // — no display-matrix drift like TextureView.getBitmap had, and
+        // small enough (~150 KB after JPEG-encoding a 1920x1080 H.264
+        // keyframe) to clear the Cloudflare quick-tunnel cleanly.
+        val rec = shotRecorder
         val handler = bgHandler
-        if (handler == null) { onDone(null); return }
+        if (rec == null || handler == null) { onDone(null); return }
         handler.post {
-            try {
-                val bitmap = Bitmap.createBitmap(
-                    previewSize.width,
-                    previewSize.height,
-                    Bitmap.Config.ARGB_8888,
-                )
-                textureView.getBitmap(bitmap)
-                val baos = ByteArrayOutputStream()
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 85, baos)
-                bitmap.recycle()
-                onDone(baos.toByteArray())
-            } catch (t: Throwable) {
-                onEvent("getBitmap failed: ${t.message}", true)
+            // 1.5 s window: encoder emits 1 keyframe / s with KEY_I_FRAME_INTERVAL=1,
+            // so a 1.0 s window can fall right between keyframes and miss. 1.5 s
+            // always contains at least one — same margin the armed-shot path uses.
+            val sliced = rec.sliceLastSeconds(1.5)
+            if (sliced == null) {
+                onEvent("calibration: ring slice failed", true)
                 onDone(null)
+                return@post
+            }
+            val tmp = java.io.File.createTempFile("calib-", ".mp4", context.cacheDir)
+            try {
+                tmp.writeBytes(sliced.bytes)
+                val mmr = MediaMetadataRetriever()
+                try {
+                    mmr.setDataSource(tmp.absolutePath)
+                    // Latest accurate keyframe — closest to "now". OPTION_CLOSEST
+                    // forces an exact decode (slower) so we don't get stuck on
+                    // an old keyframe far before the cut.
+                    val frame = mmr.getFrameAtTime(
+                        -1L,
+                        MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                    )
+                    if (frame == null) {
+                        onEvent("calibration: getFrameAtTime returned null", true)
+                        onDone(null)
+                        return@post
+                    }
+                    val baos = ByteArrayOutputStream()
+                    frame.compress(Bitmap.CompressFormat.JPEG, 85, baos)
+                    frame.recycle()
+                    onDone(baos.toByteArray())
+                } finally {
+                    try { mmr.release() } catch (_: Throwable) {}
+                }
+            } catch (t: Throwable) {
+                onEvent("calibration extract failed: ${t.message}", true)
+                onDone(null)
+            } finally {
+                try { tmp.delete() } catch (_: Throwable) {}
             }
         }
     }
@@ -329,9 +365,9 @@ class CameraController(
         }
     }
 
-    fun arm(onShot: (bytes: ByteArray, releasePtsUs: Long, impactPtsUs: Long, videoDurationS: Double) -> Unit): Boolean {
+    fun arm(matchChecker: ShotRecorder.MatchChecker?, onShot: ShotRecorder.ArmedCallback): Boolean {
         val rec = shotRecorder ?: return false
-        rec.arm(onShot)
+        rec.arm(matchChecker, onShot)
         return true
     }
 
