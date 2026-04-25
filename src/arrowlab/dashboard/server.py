@@ -1229,7 +1229,7 @@ async def _process_shot(
             f"[shot {n}] decode={timings_s['decode_s']}s "
             f"audio={timings_s['audio_detect_s']}s "
             f"flight({flight_source})={timings_s['detect_s']}s "
-            f"track={timings_s['track_s']}s frames={len(frames)}"
+            f"track={timings_s['track_s']}s frames={len(frames) if frames is not None else total_frames}"
         )
         session["trajectories"].append(traj_path)
         with open(traj_path) as f:
