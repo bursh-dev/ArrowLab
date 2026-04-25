@@ -48,12 +48,15 @@ private const val SERVER_PORT = 8000
 // Top-level `val` (not `const val`) because Kotlin disallows nullable
 // const declarations. Functionally equivalent for our use.
 //
-// Currently null: trycloudflare quick tunnels add ~30 s of latency on a
-// 200 KB calibration upload, which makes session setup painful. Phone
-// stays on the LAN-discovery path (USB tether at 127.0.0.1 first, then
-// last-known host, then /24 scan). Re-enable with the URL string once
-// we move to a stable Cloudflare named tunnel.
-private val REMOTE_BASE_URL: String? = null
+// Tailscale tailnet IP for the canonical server (son's PC). Tailscale
+// routes optimally: direct LAN when phone+server are on the same Wi-Fi,
+// P2P UDP when remote, DERP relay as last resort. Cloudflare quick
+// tunnels were rejected (added ~30 s upload latency); LAN-only was the
+// stopgap. Tailscale gives us "anywhere" access without that overhead.
+//
+// To bypass and use plain LAN discovery (USB tether → last_host → /24
+// scan), set this to null.
+private val REMOTE_BASE_URL: String? = "http://100.75.117.17:8000"
 
 class MainActivity : AppCompatActivity() {
 
@@ -224,7 +227,7 @@ class MainActivity : AppCompatActivity() {
         }
         // Try last-known-good IP (saved on prior successful connect).
         val lastHost = getSharedPreferences("arrowlab", Context.MODE_PRIVATE)
-            .getString("last_host", "172.20.214.141")
+            .getString("last_host", "192.168.1.51")
         if (!lastHost.isNullOrBlank()) {
             if (withContext(Dispatchers.IO) { probe(lastHost, port) }) {
                 appendLog("discovery: last-known-good $lastHost hit")
