@@ -1566,17 +1566,16 @@ async def _process_shot(
             anchor_offset = _flight_anchor_offset_s(LIVE_STATE["session"])
             if anchor_offset > 0:
                 impact_s = float(audio_events["impact_s"])
-                # Slightly wider pad than the 2-frame audio/video jitter case
-                # because the offset is approximate (different draw weights
-                # produce 250-350 ms flight times).
                 pad_s = 0.05
+                # Virtual release = audio_impact - anchor_offset.
+                # Virtual impact = virtual release + typical_flight_s.
+                # End auto-tracks start so the window is exactly
+                # `typical_flight_s` wide regardless of how far back the
+                # start is anchored. Operator only needs to tune ONE knob
+                # (offset) to align the window with the actual flight.
+                typical_flight_s = 0.30
                 a_guess = int(round((impact_s - anchor_offset - pad_s) * fps_probe))
-                # Cut the flight window short BEFORE audio_impact_s, since
-                # audio impact lags real impact by the same anchor_offset
-                # that release lagged. Going past audio_impact lets
-                # post-hit grass/horizon noise dominate the tracker's
-                # scoring even though the arrow has already stuck.
-                b_guess = int(round((impact_s - 0.20) * fps_probe))
+                b_guess = int(round((impact_s - anchor_offset + typical_flight_s + pad_s) * fps_probe))
             else:
                 a_guess = int(round(audio_events["release_s"] * fps_probe))
                 b_guess = int(round(audio_events["impact_s"] * fps_probe))
