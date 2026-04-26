@@ -213,6 +213,22 @@
     </details>
   </main>
 
+  <!-- Shooter overlay: shown while armed, hidden otherwise. Driven by view.js -->
+  <div class="shooter-overlay" id="shooterOverlay" data-state="ready" hidden>
+    <div class="shooter-top">
+      <button class="shooter-stop" id="shooterStopBtn">⏹ STOP</button>
+      <div class="shooter-session" id="shooterSession">—</div>
+    </div>
+    <div class="shooter-center">
+      <div class="shooter-headline" id="shooterHeadline">FIRE</div>
+      <div class="shooter-sub" id="shooterSub">armed — waiting for release</div>
+      <div class="shooter-stats" id="shooterStats" hidden>
+        <div class="shooter-stat"><div class="shooter-stat-val" id="shooterStatA">—</div><div class="shooter-stat-label" id="shooterStatLA">—</div></div>
+        <div class="shooter-stat"><div class="shooter-stat-val" id="shooterStatB">—</div><div class="shooter-stat-label" id="shooterStatLB">—</div></div>
+      </div>
+    </div>
+  </div>
+
   <script src="/static/view.js"></script>
 </body>
 </html>

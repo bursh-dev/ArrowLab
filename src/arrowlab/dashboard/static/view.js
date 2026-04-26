@@ -259,7 +259,10 @@ function logLive(line, kind = "info") {
   while (liveLog.children.length > 40) liveLog.lastChild.remove();
 }
 
+let sessionState = {};
 function applyState(st) {
+  sessionState = st;
+  if (armed && typeof shooterUpdateSession === "function") shooterUpdateSession();
   setBulb(bulbPhone, st.phone_connected,
     st.phone_connected ? "phone: connected" : "phone: none");
   setBulb(bulbSession, st.active,
@@ -440,6 +443,7 @@ function handleLiveMsg(msg) {
   } else if (msg.type === "shot_uploaded") {
     logLive(`shot ${msg.shot}: ${(msg.bytes / 1024 / 1024).toFixed(1)} MB uploaded, processing...`);
     if (!armed) setShotButton("tracking");
+    else shooterOnUploaded(msg);
   } else if (msg.type === "shot_ready") {
     logLive(`shot ${msg.shot}: ready`, "ok");
     // shots[] is synced by the state broadcast that follows; just select the new one.
@@ -450,12 +454,14 @@ function handleLiveMsg(msg) {
     }, 50);
     // Don't override the ARMED UI — armed mode keeps listening for the next shot.
     if (!armed) setShotButton("idle");
-    else flashFire();
+    else shooterOnReady(msg);
   } else if (msg.type === "shot_failed") {
     logLive(`shot ${msg.shot}: FAILED (${msg.reason || "unknown"})`, "error");
     if (!armed) {
       setShotButton("error");
       setTimeout(() => setShotButton("idle"), 3000);
+    } else {
+      shooterOnFailed(msg);
     }
   } else if (msg.type === "sound_match_result") {
     // Live per-candidate similarity scores. Useful for tuning the
@@ -475,6 +481,7 @@ function handleLiveMsg(msg) {
     } else {
       logLive(`sound-match REJECT r=${r} i=${i}`);
     }
+    if (armed) shooterOnSoundMatch(msg);
   } else if (msg.type === "armed") {
     logLive("armed — listening for release+impact", "ok");
     setArmedUI(true);
@@ -596,22 +603,107 @@ function abortCountdown() {
 
 let armed = false;
 
-// Full-viewport "FIRE" flash, shown after each processed shot while armed.
-// Visual only — voice cues were leaking into the phone mic and tripping the
-// onset detector.
-let fireFlashEl = null;
-function flashFire() {
-  if (!fireFlashEl) {
-    fireFlashEl = document.createElement("div");
-    fireFlashEl.className = "fire-flash";
-    fireFlashEl.textContent = "FIRE";
-    document.body.appendChild(fireFlashEl);
+// ===== Shooter overlay (focal armed-mode view) =====
+// Full-viewport state machine shown while armed. Every peak-pair detection
+// flips the panel through MATCHING → REJECTED or UPLOADING → RESULT/FAILED,
+// then back to READY ("FIRE"). Designed to be readable across the room.
+const shooterOverlay = document.getElementById("shooterOverlay");
+const shooterHeadline = document.getElementById("shooterHeadline");
+const shooterSub = document.getElementById("shooterSub");
+const shooterStats = document.getElementById("shooterStats");
+const shooterStatA = document.getElementById("shooterStatA");
+const shooterStatLA = document.getElementById("shooterStatLA");
+const shooterStatB = document.getElementById("shooterStatB");
+const shooterStatLB = document.getElementById("shooterStatLB");
+const shooterSession = document.getElementById("shooterSession");
+const shooterStopBtn = document.getElementById("shooterStopBtn");
+
+let shooterRevertTimer = null;
+let shooterLastSims = { release: null, impact: null };
+
+function shooterFmt(v) { return v == null ? "—" : Number(v).toFixed(2); }
+
+function shooterSetPanel(state, opts = {}) {
+  if (shooterRevertTimer) { clearTimeout(shooterRevertTimer); shooterRevertTimer = null; }
+  shooterOverlay.dataset.state = state;
+  shooterHeadline.textContent = opts.head || "";
+  shooterSub.textContent = opts.sub || "";
+  if (opts.statsShow) {
+    shooterStats.hidden = false;
+    shooterStatA.textContent = opts.statA;
+    shooterStatLA.textContent = opts.labelA;
+    shooterStatB.textContent = opts.statB;
+    shooterStatLB.textContent = opts.labelB;
+  } else {
+    shooterStats.hidden = true;
   }
-  fireFlashEl.classList.remove("show");
-  // Force reflow so the next class-add restarts the CSS animation.
-  void fireFlashEl.offsetWidth;
-  fireFlashEl.classList.add("show");
+  if (opts.revertMs) {
+    shooterRevertTimer = setTimeout(shooterReady, opts.revertMs);
+  }
 }
+function shooterReady() {
+  if (!armed) return;
+  shooterSetPanel("ready", { head: "FIRE", sub: "armed — waiting for release" });
+}
+function shooterUpdateSession() {
+  const id = (sessionState && sessionState.session_id) || "";
+  const n = (sessionState && sessionState.shot_count) || 0;
+  shooterSession.textContent = id ? `${id} · ${n} shots` : `${n} shots`;
+}
+
+function shooterOnSoundMatch(msg) {
+  shooterLastSims.release = msg.release_sim;
+  shooterLastSims.impact = msg.impact_sim;
+  if (msg.accept) return; // wait for shot_uploaded
+  shooterSetPanel("rejected", {
+    head: "Rejected",
+    sub: msg.error ? `error: ${msg.error}` : "sound did not match release/impact template",
+    statsShow: true,
+    statA: shooterFmt(msg.release_sim), labelA: "release sim",
+    statB: shooterFmt(msg.impact_sim),  labelB: "impact sim",
+    revertMs: 2200,
+  });
+}
+function shooterOnUploaded(msg) {
+  const showSims = shooterLastSims.release != null && shooterLastSims.impact != null;
+  shooterSetPanel("uploading", {
+    head: `Shot ${msg.shot}`,
+    sub: "processing…",
+    statsShow: showSims,
+    statA: showSims ? shooterFmt(shooterLastSims.release) : "—", labelA: "release sim",
+    statB: showSims ? shooterFmt(shooterLastSims.impact)  : "—", labelB: "impact sim",
+  });
+}
+function shooterOnReady(msg) {
+  const t = msg.trajectory || {};
+  const speed = t.speed_audio_ms;
+  const flightS = (t.audio_release_s != null && t.audio_impact_s != null)
+    ? (t.audio_impact_s - t.audio_release_s) : null;
+  const haveSpeed = speed != null && isFinite(speed);
+  const haveFlight = flightS != null && isFinite(flightS);
+  shooterSetPanel("result", {
+    head: `✓ Shot ${msg.shot}`,
+    sub: `${t.detections_kept ?? "?"} detections`,
+    statsShow: haveSpeed || haveFlight,
+    statA: haveSpeed ? speed.toFixed(1) : "—", labelA: "m/s",
+    statB: haveFlight ? Math.round(flightS * 1000) : "—", labelB: "ms flight",
+    revertMs: 2200,
+  });
+}
+function shooterOnFailed(msg) {
+  shooterSetPanel("failed", {
+    head: `✗ Shot ${msg.shot}`,
+    sub: msg.reason || "failed — check corridor / annotation",
+    revertMs: 2500,
+  });
+}
+
+shooterStopBtn.addEventListener("click", () => {
+  if (liveWS && liveWS.readyState === WebSocket.OPEN) {
+    liveWS.send(JSON.stringify({ type: "disarm" }));
+  }
+  setArmedUI(false);
+});
 
 function setArmedUI(on) {
   armed = on;
@@ -619,8 +711,13 @@ function setArmedUI(on) {
     shotBtn.textContent = "ARMED — tap to stop";
     shotBtn.style.background = "#b05020";
     shotBtn.disabled = false;
+    shooterUpdateSession();
+    shooterOverlay.hidden = false;
+    shooterReady();
   } else {
     setShotButton("idle");
+    shooterOverlay.hidden = true;
+    if (shooterRevertTimer) { clearTimeout(shooterRevertTimer); shooterRevertTimer = null; }
   }
 }
 
