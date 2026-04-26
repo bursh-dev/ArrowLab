@@ -651,7 +651,10 @@ function startShotCountdown() {
     }
   };
 
-  // Phase 2: 5→1 countdown
+  // Phase 2: 5→1 countdown. Operator releases the arrow ON "1". The post-
+  // countdown wait gives reaction time + arrow flight + safety margin
+  // before the slice command goes out — the rolling buffer needs to still
+  // contain the release+impact when sliced.
   let count = 5;
   const countTick = () => {
     if (my !== countdownAbortToken) return;
@@ -660,14 +663,14 @@ function startShotCountdown() {
       count--;
       setTimeout(countTick, 1000);
     } else {
-      shotBtn.textContent = "🏹 SHOOT!";
+      shotBtn.textContent = "🏹 FIRE!";
       shotBtn.style.background = "#c04040";
       setTimeout(() => {
         if (my !== countdownAbortToken) return;
         liveWS.send(JSON.stringify({ type: "trigger_shot" }));
         logLive("SHOT! triggered");
         setShotButton("recording");
-      }, 1500);
+      }, 3500);
     }
   };
 
