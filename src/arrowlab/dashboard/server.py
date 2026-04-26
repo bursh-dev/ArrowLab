@@ -1549,7 +1549,12 @@ async def _process_shot(
                 # produce 250-350 ms flight times).
                 pad_s = 0.05
                 a_guess = int(round((impact_s - anchor_offset - pad_s) * fps_probe))
-                b_guess = int(round((impact_s + pad_s) * fps_probe))
+                # Cut the flight window short BEFORE audio_impact_s, since
+                # audio impact lags real impact by the same anchor_offset
+                # that release lagged. Going past audio_impact lets
+                # post-hit grass/horizon noise dominate the tracker's
+                # scoring even though the arrow has already stuck.
+                b_guess = int(round((impact_s - 0.20) * fps_probe))
             else:
                 a_guess = int(round(audio_events["release_s"] * fps_probe))
                 b_guess = int(round(audio_events["impact_s"] * fps_probe))
@@ -1590,12 +1595,6 @@ async def _process_shot(
             shot_index=n - 1,
             log_prefix=f"[live] shot {n}",
             frames=frames,
-            # Lower than the function default of 25. With dim outdoor
-            # evening light the arrow streak's contrast against the wall
-            # was below 25, so the bg-diff didn't even produce an arrow
-            # candidate. 10 catches the streak; min_area=150 still rejects
-            # tiny grass-flicker blobs.
-            diff_threshold=10,
         )
         t_tracked = time.perf_counter()
         timings_s = {
