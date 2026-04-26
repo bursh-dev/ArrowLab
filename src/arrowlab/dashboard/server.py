@@ -175,7 +175,7 @@ def _persist_session() -> None:
         SESSION_STATE_FILE.unlink(missing_ok=True)
         return
     SESSION_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    data = {k: s.get(k) for k in ("id", "stem", "created_at", "range", "calibration_frame", "annotation", "shot_count", "fake_source", "shots", "sound_template")}
+    data = {k: s.get(k) for k in ("id", "stem", "created_at", "range", "calibration_frame", "annotation", "shot_count", "fake_source", "shots", "sound_template", "sound_match_threshold")}
     SESSION_STATE_FILE.write_text(json.dumps(data, indent=2))
 
 
@@ -187,7 +187,7 @@ def _load_persisted_session() -> None:
     except Exception:
         return
     s = _new_session()
-    for k in ("id", "stem", "created_at", "range", "calibration_frame", "annotation", "shot_count", "fake_source", "shots", "sound_template"):
+    for k in ("id", "stem", "created_at", "range", "calibration_frame", "annotation", "shot_count", "fake_source", "shots", "sound_template", "sound_match_threshold"):
         if k in data:
             s[k] = data[k]
     # Recover shots from on-disk trajectories if persisted list is empty
@@ -270,6 +270,15 @@ async def _broadcast_view(msg: dict) -> None:
             LIVE_STATE["view_wss"].remove(ws)
 
 
+def _session_threshold(s: dict | None) -> float:
+    """Per-session sound-match threshold (cosine similarity floor for accept).
+    Falls back to the module default when the session hasn't overridden it."""
+    if not s:
+        return SOUND_MATCH_THRESHOLD
+    v = s.get("sound_match_threshold")
+    return float(v) if v is not None else SOUND_MATCH_THRESHOLD
+
+
 def _session_snapshot() -> dict:
     s = LIVE_STATE["session"]
     return {
@@ -284,6 +293,7 @@ def _session_snapshot() -> dict:
         "shot_count": s["shot_count"] if s else 0,
         "fake_source": s["fake_source"] if s else None,
         "shots": s["shots"] if s else [],
+        "sound_match_threshold": _session_threshold(s),
     }
 
 
@@ -361,6 +371,23 @@ async def api_session_clear_range() -> dict:
     _persist_session()
     await _broadcast_view({"type": "state", **_session_snapshot()})
     return {"ok": True}
+
+
+class SoundMatchThreshold(BaseModel):
+    threshold: float
+
+
+@app.put("/api/session/sound-match-threshold")
+async def api_session_sound_match_threshold(t: SoundMatchThreshold) -> dict:
+    """Per-session override for the sound-match accept floor (cosine similarity).
+    Both release_sim AND impact_sim must clear this for the server to accept
+    a candidate. Clamped to [0.0, 1.0]."""
+    s = _require_session()
+    val = max(0.0, min(1.0, float(t.threshold)))
+    s["sound_match_threshold"] = val
+    _persist_session()
+    await _broadcast_view({"type": "state", **_session_snapshot()})
+    return {"ok": True, "threshold": val}
 
 
 @app.delete("/api/session/calibration")
@@ -644,6 +671,7 @@ async def api_sound_match(
     import numpy as np
     s = _require_session()
     template = s.get("sound_template")
+    threshold = _session_threshold(s)
 
     release_bytes = await release.read()
     impact_bytes = await impact.read()
@@ -654,7 +682,7 @@ async def api_sound_match(
             "no_template": True,
             "release_sim": None,
             "impact_sim": None,
-            "threshold": SOUND_MATCH_THRESHOLD,
+            "threshold": threshold,
             "release_bytes": len(release_bytes),
             "impact_bytes": len(impact_bytes),
         }
@@ -668,7 +696,7 @@ async def api_sound_match(
             return {
                 "accept": False, "error": "decode_failed",
                 "release_sim": None, "impact_sim": None,
-                "threshold": SOUND_MATCH_THRESHOLD,
+                "threshold": threshold,
             }
         rel_spec = _log_mag_spectrum(rel_pcm)
         imp_spec = _log_mag_spectrum(imp_pcm)
@@ -676,7 +704,7 @@ async def api_sound_match(
             return {
                 "accept": False, "error": "spectrum_failed",
                 "release_sim": None, "impact_sim": None,
-                "threshold": SOUND_MATCH_THRESHOLD,
+                "threshold": threshold,
             }
         rel_t = np.asarray(template["release"], dtype=np.float32)
         imp_t = np.asarray(template["impact"], dtype=np.float32)
@@ -684,19 +712,19 @@ async def api_sound_match(
             return {
                 "accept": False, "error": "shape_mismatch",
                 "release_sim": None, "impact_sim": None,
-                "threshold": SOUND_MATCH_THRESHOLD,
+                "threshold": threshold,
             }
         release_sim = float(np.dot(rel_spec, rel_t))
         impact_sim = float(np.dot(imp_spec, imp_t))
         accept = (
-            release_sim >= SOUND_MATCH_THRESHOLD
-            and impact_sim >= SOUND_MATCH_THRESHOLD
+            release_sim >= threshold
+            and impact_sim >= threshold
         )
         return {
             "accept": accept,
             "release_sim": round(release_sim, 4),
             "impact_sim": round(impact_sim, 4),
-            "threshold": SOUND_MATCH_THRESHOLD,
+            "threshold": threshold,
         }
 
     result = await run_in_threadpool(_score)

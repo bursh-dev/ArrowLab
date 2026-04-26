@@ -107,6 +107,61 @@ html, body {
 .tab-panel.active { display: flex; }
 .hidden { display: none !important; }
 
+/* ========== Sound-match threshold panel ========== */
+.sound-threshold-panel {
+  margin: 0.6rem 0;
+  padding: 0.6rem 0.8rem;
+  background: #161620;
+  border: 1px solid #2a2a3a;
+  border-radius: 4px;
+}
+.sound-threshold-row {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  flex-wrap: wrap;
+}
+.sound-threshold-row label {
+  font-size: 0.85rem;
+  color: #c0c0c0;
+  white-space: nowrap;
+}
+.sound-threshold-row input[type="range"] {
+  flex: 1;
+  min-width: 200px;
+}
+.sound-threshold-val {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  font-size: 1rem;
+  color: #fff;
+  min-width: 3.2rem;
+  text-align: right;
+}
+.sound-threshold-feed {
+  margin-top: 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.sound-threshold-feed .row {
+  display: grid;
+  grid-template-columns: auto 1fr 1fr auto;
+  gap: 0.6rem;
+  padding: 0.15rem 0.4rem;
+  border-radius: 3px;
+}
+.sound-threshold-feed .row.accept { background: rgba(80, 180, 100, 0.10); color: #b8e8c0; }
+.sound-threshold-feed .row.reject { background: rgba(200, 70, 70, 0.10); color: #f0c0c0; }
+.sound-threshold-feed .row.accept .verdict { color: #43c560; }
+.sound-threshold-feed .row.reject .verdict { color: #d04545; }
+.sound-threshold-feed .row .ts { color: #707080; }
+.sound-threshold-feed .row .sim { font-variant-numeric: tabular-nums; }
+
 /* ========== Shooter overlay (armed mode focal view) ========== */
 /* Full-viewport state-machine display, readable from across the room.
  * Shown when armed, hidden otherwise. Driven by view.js handlers. */

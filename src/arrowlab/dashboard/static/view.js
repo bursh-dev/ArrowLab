@@ -104,6 +104,71 @@ saveSoundTemplateBtn.addEventListener("click", async () => {
   logLive(`sound template saved (${j.release_count}R/${j.impact_count}I)`, "ok");
 });
 
+// ===== Sound-match threshold panel =====
+const soundThresholdSlider = document.getElementById("soundThresholdSlider");
+const soundThresholdValue = document.getElementById("soundThresholdValue");
+const soundThresholdSaveBtn = document.getElementById("soundThresholdSaveBtn");
+const soundThresholdStatus = document.getElementById("soundThresholdStatus");
+const soundThresholdFeed = document.getElementById("soundThresholdFeed");
+
+let serverThreshold = 0.80;  // last value confirmed by server; slider compares
+
+function setThresholdSlider(v, { fromServer = false } = {}) {
+  const n = Number(v);
+  if (!isFinite(n)) return;
+  soundThresholdSlider.value = n.toFixed(2);
+  soundThresholdValue.textContent = n.toFixed(2);
+  if (fromServer) serverThreshold = n;
+  soundThresholdSaveBtn.disabled = Math.abs(n - serverThreshold) < 0.005;
+}
+
+soundThresholdSlider.addEventListener("input", () => {
+  setThresholdSlider(soundThresholdSlider.value);
+});
+soundThresholdSaveBtn.addEventListener("click", async () => {
+  const v = Number(soundThresholdSlider.value);
+  soundThresholdSaveBtn.disabled = true;
+  soundThresholdStatus.textContent = "saving…";
+  try {
+    const res = await fetch("/api/session/sound-match-threshold", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ threshold: v }),
+    });
+    if (!res.ok) {
+      soundThresholdStatus.textContent = "save failed: " + await res.text();
+      soundThresholdSaveBtn.disabled = false;
+      return;
+    }
+    const j = await res.json();
+    serverThreshold = j.threshold;
+    soundThresholdStatus.textContent = `saved · ${j.threshold.toFixed(2)}`;
+    setThresholdSlider(j.threshold, { fromServer: true });
+    setTimeout(() => { soundThresholdStatus.textContent = ""; }, 2500);
+    logLive(`sound-match threshold → ${j.threshold.toFixed(2)}`, "ok");
+  } catch (e) {
+    soundThresholdStatus.textContent = "save error: " + e.message;
+    soundThresholdSaveBtn.disabled = false;
+  }
+});
+
+function pushThresholdFeed(msg) {
+  // Keep at most 20 rows; newest on top.
+  const empty = soundThresholdFeed.querySelector(".shoot-hint");
+  if (empty) empty.remove();
+  const r = msg.release_sim == null ? "—" : Number(msg.release_sim).toFixed(2);
+  const i = msg.impact_sim  == null ? "—" : Number(msg.impact_sim).toFixed(2);
+  const ts = new Date().toLocaleTimeString([], { hour12: false });
+  const verdict = msg.error ? `ERR (${msg.error})` : (msg.accept ? (msg.no_template ? "NO-TPL" : "ACCEPT") : "REJECT");
+  const row = document.createElement("div");
+  row.className = "row " + (msg.accept ? "accept" : "reject");
+  row.innerHTML = `<span class="ts">${ts}</span><span class="sim">r ${r}</span><span class="sim">i ${i}</span><span class="verdict">${verdict}</span>`;
+  soundThresholdFeed.insertBefore(row, soundThresholdFeed.firstChild);
+  while (soundThresholdFeed.children.length > 20) {
+    soundThresholdFeed.removeChild(soundThresholdFeed.lastChild);
+  }
+}
+
 function activateTab(name) {
   if (currentTab === name) return;
   currentTab = name;
@@ -263,6 +328,18 @@ let sessionState = {};
 function applyState(st) {
   sessionState = st;
   if (armed && typeof shooterUpdateSession === "function") shooterUpdateSession();
+  // Hydrate sound-match threshold slider on every state update, but only
+  // when the user isn't mid-edit (slider matches server's view).
+  if (typeof st.sound_match_threshold === "number") {
+    serverThreshold = st.sound_match_threshold;
+    if (Math.abs(Number(soundThresholdSlider.value) - serverThreshold) < 0.005) {
+      setThresholdSlider(serverThreshold, { fromServer: true });
+    } else {
+      // Slider has unsaved local edits; just update the disabled state of
+      // Save by re-evaluating the diff.
+      soundThresholdSaveBtn.disabled = false;
+    }
+  }
   setBulb(bulbPhone, st.phone_connected,
     st.phone_connected ? "phone: connected" : "phone: none");
   setBulb(bulbSession, st.active,
@@ -482,6 +559,7 @@ function handleLiveMsg(msg) {
       logLive(`sound-match REJECT r=${r} i=${i}`);
     }
     if (armed) shooterOnSoundMatch(msg);
+    pushThresholdFeed(msg);
   } else if (msg.type === "armed") {
     logLive("armed — listening for release+impact", "ok");
     setArmedUI(true);
