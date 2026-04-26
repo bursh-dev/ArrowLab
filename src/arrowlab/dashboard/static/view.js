@@ -440,6 +440,38 @@ const lastShot = document.getElementById("lastShot");
 const lastShotClip = document.getElementById("lastShotClip");
 const lastShotTracked = document.getElementById("lastShotTracked");
 const lastShotNum = document.getElementById("lastShotNum");
+const rawFrameReadout = document.getElementById("rawFrameReadout");
+const trackedFrameReadout = document.getElementById("trackedFrameReadout");
+
+// Live frame counter overlay. The HTML5 player only exposes time; we
+// multiply by the trajectory's fps to get the cv2 frame index — the same
+// numbering the tracker / debug scripts / API responses use, so the
+// operator can call out "frame 43" and we can find it.
+function updateFrameReadout(player, readout, includeOffset) {
+  if (!readout) return;
+  const t = player.currentTime || 0;
+  const traj = (selectedShot && selectedShot.trajectory) || null;
+  const fps = (traj && Number.isFinite(traj.fps)) ? traj.fps : 0;
+  // For the raw clip, the HTML5 player's t=0 corresponds to the start of
+  // the trim mp4, which begins `tracked_first_frame` into the original
+  // clip. Add that offset so frame numbers match cv2/server numbering.
+  const tFirst = (traj && Number.isFinite(traj.tracked_first_frame)) ? traj.tracked_first_frame : 1;
+  const frame = fps > 0 ? Math.round(t * fps) + (includeOffset ? tFirst - 1 : 0) : null;
+  readout.textContent = frame != null
+    ? `f${frame} · ${t.toFixed(3)}s`
+    : `${t.toFixed(3)}s`;
+}
+
+let selectedShot = null;
+[lastShotClip, lastShotTracked].forEach((player, idx) => {
+  const readout = idx === 0 ? rawFrameReadout : trackedFrameReadout;
+  // The tracked mp4 starts at tracked_first_frame, so its t=0 IS frame
+  // tracked_first_frame already. Pass includeOffset only for it.
+  const includeOffset = idx === 1;
+  ["timeupdate", "seeked", "loadedmetadata"].forEach(ev => {
+    player.addEventListener(ev, () => updateFrameReadout(player, readout, includeOffset));
+  });
+});
 const shotHistory = document.getElementById("shotHistory");
 const shotHistoryList = document.getElementById("shotHistoryList");
 const lastShotTargetPhoto = document.getElementById("lastShotTargetPhoto");
@@ -1502,6 +1534,7 @@ function selectShot(idx, { play = false } = {}) {
   if (idx < 0 || idx >= shots.length) return;
   selectedShotIdx = idx;
   const sh = shots[idx];
+  selectedShot = sh;
   lastShotNum.textContent = sh.shot;
   if (sh.clip_url) lastShotClip.src = sh.clip_url + "?t=" + Date.now();
   if (sh.tracked_url) lastShotTracked.src = sh.tracked_url + "?t=" + Date.now();

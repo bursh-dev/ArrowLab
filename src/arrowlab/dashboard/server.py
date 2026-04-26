@@ -1253,11 +1253,33 @@ def _merge_audio_from_source(src_mp4: Path, video_only_mp4: Path, start_s: float
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "64k",
             "-movflags", "+faststart",
+            # Force the container duration to track the video stream rather
+            # than the longer of v/a. Without this, browsers can read
+            # `duration=Infinity` from the moov header and refuse to render
+            # the clock — ffprobe still reports the right value, but the
+            # `<video>` element displays `0:00 / 0:00`.
+            "-shortest",
             str(tmp),
         ],
         check=True,
     )
     tmp.replace(video_only_mp4)
+    # Final pass: re-layer the moov atom at the front. The `-c copy`
+    # combined with `-movflags +faststart` in the audio-merge step doesn't
+    # always produce a moov-first layout; this cheap relayering does, and
+    # the browser then exposes `duration` correctly.
+    relayer_tmp = video_only_mp4.with_suffix(video_only_mp4.suffix + ".relayer.mp4")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", str(video_only_mp4),
+            "-c", "copy",
+            "-movflags", "+faststart",
+            str(relayer_tmp),
+        ],
+        check=True,
+    )
+    relayer_tmp.replace(video_only_mp4)
 
 
 def _looks_like_mp4(data: bytes) -> bool:

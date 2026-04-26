@@ -107,6 +107,14 @@ html, body {
 .tab-panel.active { display: flex; }
 .hidden { display: none !important; }
 
+/* ========== Video frame readout ========== */
+.frame-readout {
+  font-family: ui-monospace, monospace;
+  color: #d0d0d0;
+  font-size: 0.85em;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ========== Calibration recording panel ========== */
 .calib-record-panel {
   margin: 0.6rem 0;
