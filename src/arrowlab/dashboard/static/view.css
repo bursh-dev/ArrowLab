@@ -107,6 +107,77 @@ html, body {
 .tab-panel.active { display: flex; }
 .hidden { display: none !important; }
 
+/* ========== Calibration recording panel ========== */
+.calib-record-panel {
+  margin: 0.6rem 0;
+  padding: 0.6rem 0.8rem;
+  background: #161620;
+  border: 1px solid #2a2a3a;
+  border-radius: 4px;
+}
+.calib-record-row {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  flex-wrap: wrap;
+}
+.calib-record-row button#calibRecordStartBtn {
+  background: #6b1818;
+  border-color: #8a2020;
+  color: #fff;
+  font-weight: 600;
+}
+.calib-record-row button#calibRecordStartBtn:hover { background: #8a2020; }
+.calib-record-row button#calibRecordStartBtn.recording {
+  background: #c75c1f;
+  border-color: #d97030;
+  animation: shooter-pulse 1.2s ease-in-out infinite;
+}
+.calib-record-peaks {
+  margin-top: 0.6rem;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 0.4rem;
+}
+.calib-peak {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.4rem 0.5rem;
+  background: #0e0e16;
+  border: 1px solid #25253a;
+  border-radius: 4px;
+}
+.calib-peak.release { border-left: 4px solid #43c560; }
+.calib-peak.impact  { border-left: 4px solid #4a90d0; }
+.calib-peak.noise   { border-left: 4px solid #d04545; opacity: 0.55; }
+.calib-peak-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.8rem;
+  color: #b0b0c0;
+}
+.calib-peak audio {
+  width: 100%;
+  height: 28px;
+}
+.calib-peak-buttons {
+  display: flex;
+  gap: 0.25rem;
+}
+.calib-peak-buttons button {
+  flex: 1;
+  padding: 0.25rem;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.calib-peak-buttons button.active.rel { background: #43c560; color: #002b0a; border-color: #43c560; }
+.calib-peak-buttons button.active.imp { background: #4a90d0; color: #001230; border-color: #4a90d0; }
+.calib-peak-buttons button.active.noi { background: #d04545; color: #2b0000; border-color: #d04545; }
+
 /* ========== Sound-match threshold panel ========== */
 .sound-threshold-panel {
   margin: 0.6rem 0;

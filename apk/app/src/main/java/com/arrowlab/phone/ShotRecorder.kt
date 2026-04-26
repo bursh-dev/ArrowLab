@@ -76,6 +76,15 @@ class ShotRecorder(
         Thread(r, "ShotRecorder-trigger").also { it.isDaemon = true }
     }
 
+    // Calibration recording: when [calibrationAccumulator] is non-null, every
+    // PCM chunk read in [pumpAudio] is appended to it. Once we've collected
+    // [calibrationTargetBytes] bytes (= durationS * sampleRate * 2 for s16le
+    // mono), we fire [calibrationCallback] and clear. Independent of the
+    // ring buffers — fresh capture each invocation, no rolling.
+    @Volatile private var calibrationAccumulator: java.io.ByteArrayOutputStream? = null
+    @Volatile private var calibrationTargetBytes: Int = 0
+    @Volatile private var calibrationCallback: ((ByteArray?, Int) -> Unit)? = null
+
     /** Result of a sound-match check against the server's per-session
      *  templates. On network/HTTP error the caller should return
      *  `accept = true` so transient outages don't drop real shots. */
@@ -103,6 +112,22 @@ class ShotRecorder(
             releaseSim: Double?,
             impactSim: Double?,
         )
+    }
+
+    /** Capture [durationS] seconds of raw S16LE mono PCM at [audioSampleRate]
+     * by siphoning the existing audio pump into a fresh accumulator. The
+     * callback fires once with the full byte array + sample rate. Independent
+     * of armed mode, doesn't disturb the AAC encoder or the rolling buffers.
+     * Caller is expected to upload the result to the server. */
+    fun recordCalibrationAudio(durationS: Double, onDone: (ByteArray?, Int) -> Unit) {
+        if (calibrationAccumulator != null) {
+            onDone(null, 0)
+            return
+        }
+        val targetBytes = (audioSampleRate * 2 * durationS).toInt()
+        calibrationTargetBytes = targetBytes
+        calibrationCallback = onDone
+        calibrationAccumulator = java.io.ByteArrayOutputStream(targetBytes)
     }
 
     fun arm(matchChecker: MatchChecker?, onShot: ArmedCallback) {
@@ -343,6 +368,26 @@ class ShotRecorder(
             } catch (_: Throwable) { break }
             // Feed the live detector with this PCM chunk (no-op when disarmed).
             onsetDetector.process(pcm, read, ptsUs)
+            // If a calibration recording is active, siphon the same chunk
+            // into its accumulator. Capped at calibrationTargetBytes —
+            // we trim the last chunk and fire the callback when we cross
+            // the threshold.
+            calibrationAccumulator?.let { acc ->
+                val target = calibrationTargetBytes
+                val haveBefore = acc.size()
+                if (haveBefore >= target) return@let
+                val remaining = target - haveBefore
+                val take = if (read <= remaining) read else remaining
+                acc.write(pcm, 0, take)
+                if (acc.size() >= target) {
+                    val bytes = acc.toByteArray()
+                    val cb = calibrationCallback
+                    calibrationCallback = null
+                    calibrationAccumulator = null
+                    calibrationTargetBytes = 0
+                    cb?.invoke(bytes, audioSampleRate)
+                }
+            }
             // Stash a copy of the raw PCM in the ring so the sound-match
             // pre-filter can extract a window around any pts later. The
             // 4096-byte chunk is reused next iteration, hence the copy.

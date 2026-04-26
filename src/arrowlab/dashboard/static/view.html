@@ -199,6 +199,16 @@
 
     <!-- SOUND TAB -->
     <section class="tab-panel" data-tab="sound">
+
+      <div class="calib-record-panel">
+        <div class="calib-record-row">
+          <button id="calibRecordStartBtn">🎙 Record 30 s</button>
+          <span id="calibRecordStatus" class="shoot-hint">no recording yet</span>
+          <button id="calibRecordBuildBtn" disabled>Build template</button>
+        </div>
+        <div class="calib-record-peaks" id="calibRecordPeaks"></div>
+      </div>
+
       <div class="sound-actions">
         <button id="reloadSoundShotsBtn">Reload shots</button>
         <button id="saveSoundTemplateBtn" disabled>Save template</button>

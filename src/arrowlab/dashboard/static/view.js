@@ -104,6 +104,161 @@ saveSoundTemplateBtn.addEventListener("click", async () => {
   logLive(`sound template saved (${j.release_count}R/${j.impact_count}I)`, "ok");
 });
 
+// ===== Calibration recording (30 s capture + per-peak labeling) =====
+const calibRecordStartBtn = document.getElementById("calibRecordStartBtn");
+const calibRecordStatus = document.getElementById("calibRecordStatus");
+const calibRecordBuildBtn = document.getElementById("calibRecordBuildBtn");
+const calibRecordPeaks = document.getElementById("calibRecordPeaks");
+
+let calibRecordingState = "idle"; // "idle" | "recording" | "ready"
+let calibRecordCountdownTimer = null;
+
+calibRecordStartBtn.addEventListener("click", async () => {
+  if (calibRecordingState === "recording") return;
+  try {
+    const res = await fetch("/api/calibration-record/start?duration=30", { method: "POST" });
+    if (!res.ok) {
+      calibRecordStatus.textContent = "start failed: " + await res.text();
+      return;
+    }
+    setCalibRecording(30);
+  } catch (e) {
+    calibRecordStatus.textContent = "start error: " + e.message;
+  }
+});
+
+function setCalibRecording(durationS) {
+  calibRecordingState = "recording";
+  calibRecordStartBtn.classList.add("recording");
+  calibRecordStartBtn.disabled = true;
+  calibRecordPeaks.innerHTML = "";
+  let remaining = Math.round(durationS);
+  const tick = () => {
+    if (calibRecordingState !== "recording") return;
+    calibRecordStatus.textContent = `recording… ${remaining}s left — fire 5 arrows`;
+    remaining--;
+    if (remaining < 0) {
+      calibRecordStatus.textContent = "uploading & detecting peaks…";
+      return;
+    }
+    calibRecordCountdownTimer = setTimeout(tick, 1000);
+  };
+  tick();
+}
+
+function clearCalibRecording() {
+  calibRecordingState = "idle";
+  calibRecordStartBtn.classList.remove("recording");
+  calibRecordStartBtn.disabled = false;
+  if (calibRecordCountdownTimer) { clearTimeout(calibRecordCountdownTimer); calibRecordCountdownTimer = null; }
+}
+
+async function loadCalibRecord() {
+  try {
+    const res = await fetch("/api/calibration-record");
+    if (!res.ok) return;
+    const j = await res.json();
+    if (!j.exists) {
+      calibRecordPeaks.innerHTML = "";
+      calibRecordStatus.textContent = "no recording yet";
+      calibRecordBuildBtn.disabled = true;
+      return;
+    }
+    renderCalibPeaks(j);
+  } catch (e) {
+    calibRecordStatus.textContent = "load error: " + e.message;
+  }
+}
+
+function renderCalibPeaks(data) {
+  clearCalibRecording();
+  calibRecordingState = "ready";
+  calibRecordPeaks.innerHTML = "";
+  const labels = data.labels || {};
+  data.peaks.forEach((p, idx) => {
+    const row = document.createElement("div");
+    row.className = "calib-peak";
+    const lbl = labels[String(idx)];
+    if (lbl) row.classList.add(lbl);
+    row.innerHTML = `
+      <div class="calib-peak-head">
+        <span>#${idx + 1} · t=${p.t_s.toFixed(2)}s</span>
+        <span>amp ${p.amplitude.toFixed(3)}</span>
+      </div>
+      <audio controls preload="metadata" src="/api/calibration-record/snippet/${idx}.wav"></audio>
+      <div class="calib-peak-buttons">
+        <button data-label="release" class="rel ${lbl === 'release' ? 'active' : ''}">Release</button>
+        <button data-label="impact"  class="imp ${lbl === 'impact'  ? 'active' : ''}">Impact</button>
+        <button data-label="noise"   class="noi ${lbl === 'noise'   ? 'active' : ''}">Noise</button>
+        <button data-label="">✕</button>
+      </div>
+    `;
+    row.querySelectorAll(".calib-peak-buttons button").forEach(b => {
+      b.addEventListener("click", () => labelCalibPeak(idx, b.dataset.label, row));
+    });
+    calibRecordPeaks.appendChild(row);
+  });
+  refreshCalibCounts(labels);
+}
+
+async function labelCalibPeak(peakIdx, label, row) {
+  // Optimistic update
+  row.classList.remove("release", "impact", "noise");
+  if (label) row.classList.add(label);
+  row.querySelectorAll(".calib-peak-buttons button").forEach(b => {
+    b.classList.toggle("active", b.dataset.label === label && label !== "");
+  });
+  try {
+    const body = { labels: { [String(peakIdx)]: label || null } };
+    const res = await fetch("/api/calibration-record/labels", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      calibRecordStatus.textContent = "label save failed";
+      return;
+    }
+    const j = await res.json();
+    refreshCalibCounts(null, j.counts);
+  } catch (e) {
+    calibRecordStatus.textContent = "label error: " + e.message;
+  }
+}
+
+function refreshCalibCounts(labelsMap, counts) {
+  if (!counts && labelsMap) {
+    counts = { release: 0, impact: 0, noise: 0 };
+    Object.values(labelsMap).forEach(v => { if (counts[v] != null) counts[v]++; });
+  }
+  if (!counts) counts = { release: 0, impact: 0, noise: 0 };
+  calibRecordStatus.textContent =
+    `${counts.release} release · ${counts.impact} impact · ${counts.noise} noise`;
+  calibRecordBuildBtn.disabled = !(counts.release >= 2 && counts.impact >= 2);
+}
+
+calibRecordBuildBtn.addEventListener("click", async () => {
+  calibRecordBuildBtn.disabled = true;
+  calibRecordStatus.textContent = "building template…";
+  try {
+    const res = await fetch("/api/calibration-record/build-template", { method: "POST" });
+    if (!res.ok) {
+      calibRecordStatus.textContent = "build failed: " + await res.text();
+      calibRecordBuildBtn.disabled = false;
+      return;
+    }
+    const j = await res.json();
+    calibRecordStatus.textContent = `template saved · ${j.release_count}R/${j.impact_count}I (${j.template_bins} bins)`;
+    logLive(`calibration template built (${j.release_count}R/${j.impact_count}I)`, "ok");
+  } catch (e) {
+    calibRecordStatus.textContent = "build error: " + e.message;
+    calibRecordBuildBtn.disabled = false;
+  }
+});
+
+// Try loading any existing recording on page load
+loadCalibRecord();
+
 // ===== Sound-match threshold panel =====
 const soundThresholdSlider = document.getElementById("soundThresholdSlider");
 const soundThresholdValue = document.getElementById("soundThresholdValue");
@@ -560,6 +715,12 @@ function handleLiveMsg(msg) {
     }
     if (armed) shooterOnSoundMatch(msg);
     pushThresholdFeed(msg);
+  } else if (msg.type === "calibration_record_started") {
+    logLive(`calibration recording started (${msg.duration}s)`);
+    setCalibRecording(msg.duration);
+  } else if (msg.type === "calibration_record_ready") {
+    logLive(`calibration recording ready: ${msg.peak_count} peaks`, "ok");
+    loadCalibRecord();
   } else if (msg.type === "armed") {
     logLive("armed — listening for release+impact", "ok");
     setArmedUI(true);

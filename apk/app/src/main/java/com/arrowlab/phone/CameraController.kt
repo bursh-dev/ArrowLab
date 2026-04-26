@@ -374,4 +374,9 @@ class CameraController(
     fun disarm() {
         shotRecorder?.disarm()
     }
+
+    fun recordCalibrationAudio(durationS: Double, onDone: (ByteArray?, Int) -> Unit) {
+        val rec = shotRecorder ?: return onDone(null, 0)
+        rec.recordCalibrationAudio(durationS, onDone)
+    }
 }

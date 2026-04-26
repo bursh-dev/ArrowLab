@@ -473,6 +473,46 @@ class MainActivity : AppCompatActivity() {
             "disarm" -> {
                 cameraController?.disarm()
             }
+            "record_calibration" -> {
+                val duration = msg.optDouble("duration", 30.0)
+                appendLog("calibration recording: capturing ${duration.toInt()}s of audio…")
+                cameraController?.recordCalibrationAudio(duration) { bytes, sampleRate ->
+                    runOnUiThread {
+                        if (bytes == null) {
+                            appendLog("calibration recording failed", error = true)
+                        } else {
+                            appendLog("calibration: ${bytes.size / 1024} KB captured, uploading…", ok = true)
+                            uploadCalibrationRecord(bytes, sampleRate, duration)
+                        }
+                    }
+                } ?: appendLog("camera not ready for calibration", error = true)
+            }
+        }
+    }
+
+    private fun uploadCalibrationRecord(bytes: ByteArray, sampleRate: Int, durationS: Double) {
+        val baseUrl = currentBaseUrl ?: return
+        scope.launch(Dispatchers.IO) {
+            try {
+                val body = bytes.toRequestBody("application/octet-stream".toMediaType())
+                val req = Request.Builder()
+                    .url("$baseUrl/api/calibration-record")
+                    .post(body)
+                    .addHeader("X-Sample-Rate", sampleRate.toString())
+                    .addHeader("X-Duration-S", "%.3f".format(durationS))
+                    .build()
+                http.newCall(req).execute().use { resp ->
+                    runOnUiThread {
+                        if (resp.isSuccessful) {
+                            appendLog("calibration recording uploaded", ok = true)
+                        } else {
+                            appendLog("calibration upload failed: HTTP ${resp.code}", error = true)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                runOnUiThread { appendLog("calibration upload error: ${e.message}", error = true) }
+            }
         }
     }
 

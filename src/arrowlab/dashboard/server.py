@@ -439,6 +439,12 @@ async def api_session_delete_shot(n: int) -> dict:
 
 SOUND_SNIPPET_DIR = DATA_RAW / "sessions" / "sound_snippets"
 SNIPPET_DURATION_S = 0.30
+CALIBRATION_RECORD_DURATION_S = 30.0
+# Aggressive scale for the calibration peak detector — better to surface 50
+# candidates and let the operator label 40 as "noise" than to miss the 10
+# real release/impact peaks. The runtime armed-mode detector uses a stricter
+# 3.5× scale; we deliberately drop here so borderline peaks are visible too.
+CALIBRATION_PEAK_SCALE = 2.0
 # Both release AND impact similarities must clear this for a candidate to be
 # accepted. Log-mag cosine against per-session templates.
 SOUND_MATCH_THRESHOLD = 0.80
@@ -642,6 +648,289 @@ def api_calibration_sound_template(req: SoundTemplateRequest) -> dict:
         "template_bins": int(release_template.size),
         "release_self_scores": _self_scores(release_template, release_tagged),
         "impact_self_scores": _self_scores(impact_template, impact_tagged),
+    }
+
+
+# ============================================================================
+# Calibration recording — operator records a 30 s audio session, fires ~5
+# arrows during it, server peak-detects everything, operator labels each peak
+# as release/impact/noise, server averages spectra into per-session templates.
+#
+# This is the canonical "first calibration of a new setup" flow. Replaces
+# the older N=1 auto-detected calibration when templates need rebuilding.
+# ============================================================================
+
+CALIBRATION_RECORD_PCM = "_calibration_record.pcm"
+CALIBRATION_RECORD_SIDECAR = "_calibration_record.json"
+
+
+def _calibration_record_paths(session: dict) -> tuple[Path, Path]:
+    stem = session["stem"]
+    base = DATA_RAW / "sessions"
+    return (
+        base / f"{stem}{CALIBRATION_RECORD_PCM}",
+        base / f"{stem}{CALIBRATION_RECORD_SIDECAR}",
+    )
+
+
+def _detect_peaks_in_pcm(pcm_bytes: bytes, src_rate: int) -> list[dict]:
+    """Aggressive envelope-based peak detector. Converts s16le mono to f32,
+    smooths the absolute envelope with a 10 ms moving average, finds local
+    maxima above `noise_floor * CALIBRATION_PEAK_SCALE`, applies 50 ms NMS.
+
+    Returns list of {idx, t_s, amplitude, env}. Designed to over-surface
+    rather than under-surface — operator labels false peaks as 'noise'.
+    """
+    import numpy as np
+    if not pcm_bytes:
+        return []
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    if samples.size < src_rate // 10:
+        return []
+    abs_env = np.abs(samples)
+    # 10 ms moving average — short enough to keep onset transients sharp.
+    win = max(1, int(src_rate * 0.010))
+    kernel = np.ones(win, dtype=np.float32) / win
+    env = np.convolve(abs_env, kernel, mode="same")
+
+    # Adaptive noise floor = median of envelope. Robust to a few loud peaks.
+    noise = float(np.median(env)) + 1e-6
+    threshold = noise * CALIBRATION_PEAK_SCALE
+    threshold = max(threshold, 0.005)  # absolute floor (~ -46 dBFS)
+
+    # NMS window: 50 ms either side. Two release/impact events from one shot
+    # are typically 250-400 ms apart, so 50 ms is safe.
+    nms = max(1, int(src_rate * 0.050))
+
+    above = env > threshold
+    peaks: list[dict] = []
+    i = 0
+    while i < env.size:
+        if not above[i]:
+            i += 1
+            continue
+        # Find local max within the contiguous "above" region + nms window
+        j = min(env.size, i + nms)
+        local_max_idx = int(i + np.argmax(env[i:j]))
+        peaks.append({
+            "idx": local_max_idx,
+            "t_s": local_max_idx / float(src_rate),
+            "amplitude": float(abs_env[local_max_idx]),
+            "env": float(env[local_max_idx]),
+        })
+        i = local_max_idx + nms
+    return peaks
+
+
+def _wav_header_s16le_mono(num_samples: int, sample_rate: int) -> bytes:
+    """44-byte WAV/RIFF header for s16le mono PCM. Stick this in front of
+    raw PCM bytes and you have a valid .wav file the browser can play."""
+    import struct
+    byte_rate = sample_rate * 2
+    block_align = 2
+    data_size = num_samples * 2
+    return (
+        b"RIFF" + struct.pack("<I", 36 + data_size) + b"WAVE"
+        + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, byte_rate, block_align, 16)
+        + b"data" + struct.pack("<I", data_size)
+    )
+
+
+def _pcm_window_wav(pcm_bytes: bytes, src_rate: int, center_idx: int, duration_s: float) -> bytes:
+    """Slice a window of `duration_s` centred on sample `center_idx` from raw
+    s16le PCM and return it wrapped in a WAV header."""
+    half = int(src_rate * duration_s / 2) * 2  # bytes
+    bytes_per_sample = 2
+    center_byte = center_idx * bytes_per_sample
+    start = max(0, center_byte - half)
+    end = min(len(pcm_bytes), start + 2 * half)
+    window = pcm_bytes[start:end]
+    num_samples = len(window) // 2
+    return _wav_header_s16le_mono(num_samples, src_rate) + window
+
+
+@app.post("/api/calibration-record/start")
+async def api_calibration_record_start(duration: float = CALIBRATION_RECORD_DURATION_S) -> dict:
+    """Operator initiates a calibration recording. Server forwards to phone
+    over /ws/phone, phone passively records `duration` seconds of raw PCM
+    and uploads to POST /api/calibration-record."""
+    s = _require_session()
+    phone = LIVE_STATE["phone_ws"]
+    if phone is None:
+        raise HTTPException(503, "no phone connected")
+    duration = max(5.0, min(120.0, float(duration)))
+    await phone.send_json({"type": "record_calibration", "duration": duration})
+    await _broadcast_view({
+        "type": "calibration_record_started", "duration": duration,
+    })
+    return {"ok": True, "duration": duration}
+
+
+@app.post("/api/calibration-record")
+async def api_calibration_record(request: Request) -> dict:
+    """Phone uploads the raw s16le mono PCM bytes here. Headers carry the
+    sample rate (X-Sample-Rate) and duration (X-Duration-S). Server saves
+    the PCM, runs aggressive peak detection, persists peaks + empty labels
+    to the sidecar JSON, broadcasts `calibration_record_ready` to /ws/view.
+    """
+    s = _require_session()
+    body = await request.body()
+    if not body:
+        raise HTTPException(400, "empty body")
+    src_rate = int(request.headers.get("X-Sample-Rate", "44100"))
+    duration_s = float(request.headers.get("X-Duration-S", "0") or "0")
+
+    pcm_path, sidecar_path = _calibration_record_paths(s)
+    pcm_path.parent.mkdir(parents=True, exist_ok=True)
+    pcm_path.write_bytes(body)
+
+    peaks = _detect_peaks_in_pcm(body, src_rate)
+    sidecar = {
+        "stem": s["stem"],
+        "src_rate": src_rate,
+        "duration_s": duration_s if duration_s > 0 else len(body) / 2 / src_rate,
+        "bytes": len(body),
+        "peaks": peaks,
+        "labels": {},  # peak_idx (str) -> "release" | "impact" | "noise"
+    }
+    sidecar_path.write_text(json.dumps(sidecar, indent=2))
+
+    await _broadcast_view({
+        "type": "calibration_record_ready",
+        "peak_count": len(peaks),
+        "duration_s": sidecar["duration_s"],
+    })
+    return {"ok": True, "peak_count": len(peaks), "duration_s": sidecar["duration_s"]}
+
+
+def _load_calibration_sidecar(s: dict) -> dict | None:
+    _, sidecar_path = _calibration_record_paths(s)
+    if not sidecar_path.exists():
+        return None
+    try:
+        return json.loads(sidecar_path.read_text())
+    except Exception:
+        return None
+
+
+@app.get("/api/calibration-record")
+def api_calibration_record_get() -> dict:
+    s = _require_session()
+    sidecar = _load_calibration_sidecar(s)
+    if sidecar is None:
+        return {"exists": False}
+    return {"exists": True, **sidecar}
+
+
+@app.get("/api/calibration-record/snippet/{peak_idx}.wav")
+def api_calibration_record_snippet(peak_idx: int):
+    from fastapi.responses import Response
+    s = _require_session()
+    sidecar = _load_calibration_sidecar(s)
+    if sidecar is None:
+        raise HTTPException(404, "no calibration recording")
+    if peak_idx < 0 or peak_idx >= len(sidecar["peaks"]):
+        raise HTTPException(404, "peak index out of range")
+    pcm_path, _ = _calibration_record_paths(s)
+    pcm_bytes = pcm_path.read_bytes()
+    p = sidecar["peaks"][peak_idx]
+    wav = _pcm_window_wav(pcm_bytes, sidecar["src_rate"], int(p["idx"]), SNIPPET_DURATION_S)
+    return Response(content=wav, media_type="audio/wav")
+
+
+class CalibrationLabelRequest(BaseModel):
+    labels: dict[str, str | None]
+
+
+@app.put("/api/calibration-record/labels")
+async def api_calibration_record_labels(req: CalibrationLabelRequest) -> dict:
+    s = _require_session()
+    sidecar = _load_calibration_sidecar(s)
+    if sidecar is None:
+        raise HTTPException(404, "no calibration recording")
+    valid = {"release", "impact", "noise"}
+    for k, v in req.labels.items():
+        if v is None:
+            sidecar["labels"].pop(k, None)
+        elif v in valid:
+            sidecar["labels"][k] = v
+    _, sidecar_path = _calibration_record_paths(s)
+    sidecar_path.write_text(json.dumps(sidecar, indent=2))
+    counts = {kind: sum(1 for v in sidecar["labels"].values() if v == kind) for kind in valid}
+    return {"ok": True, "counts": counts}
+
+
+@app.post("/api/calibration-record/build-template")
+async def api_calibration_record_build_template() -> dict:
+    """Average log-mag spectra of release-labeled and impact-labeled peaks,
+    write to s["sound_template"]. Refuses if either bucket has <2 samples
+    (single-peak templates are exactly the brittle problem this flow solves)."""
+    import numpy as np
+    s = _require_session()
+    sidecar = _load_calibration_sidecar(s)
+    if sidecar is None:
+        raise HTTPException(404, "no calibration recording")
+
+    pcm_path, _ = _calibration_record_paths(s)
+    pcm_bytes = pcm_path.read_bytes()
+    src_rate = int(sidecar["src_rate"])
+
+    release_specs: list = []
+    impact_specs: list = []
+    for k_str, label in sidecar["labels"].items():
+        try:
+            peak_idx = int(k_str)
+        except ValueError:
+            continue
+        if peak_idx < 0 or peak_idx >= len(sidecar["peaks"]):
+            continue
+        if label not in ("release", "impact"):
+            continue
+        sample_idx = int(sidecar["peaks"][peak_idx]["idx"])
+        # Slice ±SNIPPET_DURATION_S/2 of raw PCM around the peak, resample,
+        # spectrum.
+        bytes_per_sample = 2
+        half = int(src_rate * SNIPPET_DURATION_S / 2) * bytes_per_sample
+        start = max(0, sample_idx * bytes_per_sample - half)
+        end = min(len(pcm_bytes), start + 2 * half)
+        window = pcm_bytes[start:end]
+        pcm_f32_16k = _decode_pcm_s16_to_f32_16k(window, src_rate)
+        spec = _log_mag_spectrum(pcm_f32_16k)
+        if spec is None:
+            continue
+        if label == "release":
+            release_specs.append(spec)
+        else:
+            impact_specs.append(spec)
+
+    if len(release_specs) < 2 or len(impact_specs) < 2:
+        raise HTTPException(
+            400,
+            f"need ≥2 release and ≥2 impact labels (got release={len(release_specs)} impact={len(impact_specs)})",
+        )
+
+    rel = np.mean(np.stack(release_specs), axis=0)
+    imp = np.mean(np.stack(impact_specs), axis=0)
+    rel_norm = float(np.linalg.norm(rel))
+    imp_norm = float(np.linalg.norm(imp))
+    if rel_norm == 0 or imp_norm == 0:
+        raise HTTPException(400, "template averaging produced zero norm")
+    rel = (rel / rel_norm).tolist()
+    imp = (imp / imp_norm).tolist()
+    s["sound_template"] = {
+        "release": rel,
+        "impact": imp,
+        "release_count": len(release_specs),
+        "impact_count": len(impact_specs),
+        "source": "calibration_record",
+    }
+    _persist_session()
+    await _broadcast_view({"type": "state", **_session_snapshot()})
+    return {
+        "ok": True,
+        "release_count": len(release_specs),
+        "impact_count": len(impact_specs),
+        "template_bins": len(rel),
     }
 
 
