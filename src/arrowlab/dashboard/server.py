@@ -1590,6 +1590,12 @@ async def _process_shot(
             shot_index=n - 1,
             log_prefix=f"[live] shot {n}",
             frames=frames,
+            # Lower than the function default of 25. With dim outdoor
+            # evening light the arrow streak's contrast against the wall
+            # was below 25, so the bg-diff didn't even produce an arrow
+            # candidate. 10 catches the streak; min_area=150 still rejects
+            # tiny grass-flicker blobs.
+            diff_threshold=10,
         )
         t_tracked = time.perf_counter()
         timings_s = {
