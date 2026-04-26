@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ArrowLab — Shooter View Wireframe</title>
+<style>
+  :root {
+    --bg-disarmed: #1a1a1a;
+    --bg-ready: #0a2540;
+    --bg-matching: #b58900;
+    --bg-rejected: #8b0000;
+    --bg-uploading: #c75c1f;
+    --bg-result: #1f7a3a;
+    --bg-failed: #6b1818;
+    --fg-bright: #ffffff;
+    --fg-dim: #c0c0c0;
+    --fg-subtle: #909090;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: #000;
+    color: var(--fg-bright);
+    overflow: hidden;
+  }
+
+  /* ========= Main shooter panel ========= */
+  .stage {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 80px;
+    display: flex;
+    flex-direction: column;
+    transition: background-color 250ms ease;
+  }
+  /* Top strip: small persistent context */
+  .topstrip {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 32px;
+    font-size: 18px;
+    color: var(--fg-subtle);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .topstrip .session {
+    font-variant-numeric: tabular-nums;
+  }
+  .topstrip .bulbs {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+  .bulb {
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: #4a4a4a;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.15);
+  }
+  .bulb.ok { background: #43c560; box-shadow: 0 0 8px #43c560; }
+  .bulb.warn { background: #e8c547; box-shadow: 0 0 8px #e8c547; }
+  .bulb.bad { background: #d04545; box-shadow: 0 0 8px #d04545; }
+
+  /* Center: giant state */
+  .center {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    text-align: center;
+  }
+  .headline {
+    font-size: 22vh;
+    font-weight: 900;
+    line-height: 0.95;
+    letter-spacing: -0.02em;
+    text-shadow: 0 4px 24px rgba(0,0,0,0.5);
+  }
+  .sub {
+    font-size: 4vh;
+    margin-top: 3vh;
+    color: var(--fg-dim);
+    font-weight: 500;
+    letter-spacing: 0.02em;
+  }
+  .stats {
+    margin-top: 5vh;
+    display: flex;
+    gap: 8vw;
+    font-variant-numeric: tabular-nums;
+  }
+  .stats .stat {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .stats .stat-val {
+    font-size: 6vh;
+    font-weight: 700;
+  }
+  .stats .stat-label {
+    font-size: 2.2vh;
+    color: var(--fg-subtle);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-top: 0.5vh;
+  }
+
+  /* State styles */
+  .stage[data-state="disarmed"] {
+    background: var(--bg-disarmed);
+  }
+  .stage[data-state="disarmed"] .headline {
+    color: var(--fg-subtle);
+    font-weight: 400;
+    font-size: 12vh;
+  }
+  .stage[data-state="ready"] {
+    background: var(--bg-ready);
+  }
+  .stage[data-state="ready"] .headline {
+    color: var(--fg-bright);
+    animation: subtle-pulse 1.6s ease-in-out infinite;
+  }
+  .stage[data-state="matching"] {
+    background: var(--bg-matching);
+  }
+  .stage[data-state="matching"] .headline {
+    color: #2a1f00;
+  }
+  .stage[data-state="matching"] .sub { color: #4a3500; }
+  .stage[data-state="rejected"] {
+    background: var(--bg-rejected);
+    animation: rejected-flash 400ms ease-out;
+  }
+  .stage[data-state="rejected"] .headline {
+    color: #ffe4e4;
+  }
+  .stage[data-state="uploading"] {
+    background: var(--bg-uploading);
+  }
+  .stage[data-state="uploading"] .headline {
+    animation: subtle-pulse 1s ease-in-out infinite;
+  }
+  .stage[data-state="result"] {
+    background: var(--bg-result);
+    animation: result-flash 300ms ease-out;
+  }
+  .stage[data-state="result"] .headline {
+    color: #d8ffe4;
+  }
+  .stage[data-state="failed"] {
+    background: var(--bg-failed);
+  }
+  .stage[data-state="failed"] .headline {
+    color: #ffe4e4;
+  }
+
+  @keyframes subtle-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.78; }
+  }
+  @keyframes rejected-flash {
+    0% { background: #ff4040; }
+    100% { background: var(--bg-rejected); }
+  }
+  @keyframes result-flash {
+    0% { background: #4ce070; }
+    100% { background: var(--bg-result); }
+  }
+
+  /* ========= State cycler (REMOVED in real version) ========= */
+  .cycler {
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    height: 80px;
+    background: #0d0d0d;
+    border-top: 1px solid #2a2a2a;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 16px;
+    overflow-x: auto;
+    z-index: 10;
+  }
+  .cycler-label {
+    color: var(--fg-subtle);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-right: 12px;
+    flex-shrink: 0;
+  }
+  .cycler button {
+    background: #1f1f1f;
+    color: var(--fg-dim);
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 10px 18px;
+    cursor: pointer;
+    font-size: 13px;
+    font-family: inherit;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    flex-shrink: 0;
+    transition: all 120ms;
+  }
+  .cycler button:hover {
+    background: #2a2a2a;
+    color: var(--fg-bright);
+  }
+  .cycler button.active {
+    background: #43c560;
+    color: #002b0a;
+    border-color: #43c560;
+    font-weight: 600;
+  }
+  .badge {
+    position: fixed;
+    top: 8px; left: 50%;
+    transform: translateX(-50%);
+    background: rgba(255,255,0,0.15);
+    color: #ffeb3b;
+    padding: 2px 12px;
+    border-radius: 12px;
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    z-index: 5;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<div class="badge">wireframe — preview only</div>
+
+<div class="stage" data-state="ready" id="stage">
+  <div class="topstrip">
+    <div class="session" id="topL">SESS_20260421_184719 · SHOT 47</div>
+    <div class="bulbs" id="topR">
+      <div class="bulb ok" title="phone"></div>
+      <div class="bulb ok" title="session"></div>
+      <div class="bulb ok" title="annotation"></div>
+    </div>
+  </div>
+  <div class="center">
+    <div class="headline" id="headline">FIRE</div>
+    <div class="sub" id="sub">armed — waiting for release</div>
+    <div class="stats" id="stats" style="display:none">
+      <div class="stat"><div class="stat-val" id="statA">—</div><div class="stat-label" id="statLA">—</div></div>
+      <div class="stat"><div class="stat-val" id="statB">—</div><div class="stat-label" id="statLB">—</div></div>
+    </div>
+  </div>
+</div>
+
+<div class="cycler">
+  <div class="cycler-label">preview state →</div>
+  <button data-s="disarmed">DISARMED</button>
+  <button data-s="ready" class="active">READY · FIRE</button>
+  <button data-s="matching">MATCHING</button>
+  <button data-s="rejected">REJECTED</button>
+  <button data-s="uploading">UPLOADING</button>
+  <button data-s="result">RESULT</button>
+  <button data-s="failed">FAILED</button>
+</div>
+
+<script>
+const stage = document.getElementById('stage');
+const headline = document.getElementById('headline');
+const sub = document.getElementById('sub');
+const stats = document.getElementById('stats');
+const statA = document.getElementById('statA');
+const statB = document.getElementById('statB');
+const statLA = document.getElementById('statLA');
+const statLB = document.getElementById('statLB');
+
+const presets = {
+  disarmed: {
+    head: 'Press SHOT to arm',
+    sub:  'session sess_20260421_184719 · 5 shots so far',
+    statsShow: false,
+  },
+  ready: {
+    head: 'FIRE',
+    sub:  'armed — waiting for release',
+    statsShow: false,
+  },
+  matching: {
+    head: 'Checking…',
+    sub:  'sound match against template',
+    statsShow: false,
+  },
+  rejected: {
+    head: 'Rejected',
+    sub:  'sound did not match release/impact template',
+    statsShow: true,
+    statA: '0.42', labelA: 'release sim',
+    statB: '0.63', labelB: 'impact sim',
+  },
+  uploading: {
+    head: 'Shot 47',
+    sub:  'processing…',
+    statsShow: true,
+    statA: '0.91', labelA: 'release sim',
+    statB: '0.88', labelB: 'impact sim',
+  },
+  result: {
+    head: '✓ Shot 47',
+    sub:  'tracked — 29 detections',
+    statsShow: true,
+    statA: '34.7', labelA: 'm/s',
+    statB: '317', labelB: 'ms flight',
+  },
+  failed: {
+    head: '✗ Shot 47',
+    sub:  'no flight detected — check corridor',
+    statsShow: false,
+  },
+};
+
+function setState(s) {
+  stage.dataset.state = s;
+  const p = presets[s];
+  headline.textContent = p.head;
+  sub.textContent = p.sub;
+  if (p.statsShow) {
+    stats.style.display = '';
+    statA.textContent = p.statA;
+    statB.textContent = p.statB;
+    statLA.textContent = p.labelA;
+    statLB.textContent = p.labelB;
+  } else {
+    stats.style.display = 'none';
+  }
+  document.querySelectorAll('.cycler button').forEach(b => {
+    b.classList.toggle('active', b.dataset.s === s);
+  });
+}
+
+document.querySelectorAll('.cycler button').forEach(btn => {
+  btn.addEventListener('click', () => setState(btn.dataset.s));
+});
+
+// Keyboard: number keys 1-7
+const order = ['disarmed','ready','matching','rejected','uploading','result','failed'];
+document.addEventListener('keydown', (e) => {
+  const i = parseInt(e.key, 10);
+  if (!isNaN(i) && i >= 1 && i <= order.length) setState(order[i-1]);
+});
+</script>
+
+</body>
+</html>

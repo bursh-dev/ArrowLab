@@ -43,6 +43,11 @@ def view_page() -> str:
     return (STATIC_DIR / "view.html").read_text(encoding="utf-8")
 
 
+@app.get("/shoot", response_class=HTMLResponse)
+def shoot_page() -> str:
+    return (STATIC_DIR / "shoot.html").read_text(encoding="utf-8")
+
+
 @app.get("/api/videos")
 def list_videos() -> list[str]:
     videos: list[str] = []

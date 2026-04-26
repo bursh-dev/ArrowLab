@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ArrowLab — Shooter</title>
+<style>
+  :root {
+    --bg-disarmed: #1a1a1a;
+    --bg-ready: #0a2540;
+    --bg-rejected: #8b0000;
+    --bg-uploading: #c75c1f;
+    --bg-result: #1f7a3a;
+    --bg-failed: #6b1818;
+    --bg-offline: #2a1a1a;
+    --fg-bright: #ffffff;
+    --fg-dim: #c0c0c0;
+    --fg-subtle: #909090;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: #000;
+    color: var(--fg-bright);
+    overflow: hidden;
+    cursor: none;  /* hide cursor when in shooter view */
+  }
+  body:hover { cursor: default; }
+
+  .stage {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    display: flex;
+    flex-direction: column;
+    transition: background-color 250ms ease;
+  }
+  .topstrip {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 32px;
+    font-size: 18px;
+    color: var(--fg-subtle);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .topstrip a {
+    color: var(--fg-subtle);
+    text-decoration: none;
+  }
+  .topstrip a:hover { color: var(--fg-bright); }
+  .topstrip .session {
+    font-variant-numeric: tabular-nums;
+  }
+  .topstrip .bulbs {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+  .bulb {
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: #4a4a4a;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.15);
+  }
+  .bulb.ok { background: #43c560; box-shadow: 0 0 8px #43c560; }
+  .bulb.warn { background: #e8c547; box-shadow: 0 0 8px #e8c547; }
+  .bulb.bad { background: #d04545; box-shadow: 0 0 8px #d04545; }
+
+  .center {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    text-align: center;
+  }
+  .headline {
+    font-size: 22vh;
+    font-weight: 900;
+    line-height: 0.95;
+    letter-spacing: -0.02em;
+    text-shadow: 0 4px 24px rgba(0,0,0,0.5);
+  }
+  .sub {
+    font-size: 4vh;
+    margin-top: 3vh;
+    color: var(--fg-dim);
+    font-weight: 500;
+    letter-spacing: 0.02em;
+  }
+  .stats {
+    margin-top: 5vh;
+    display: flex;
+    gap: 8vw;
+    font-variant-numeric: tabular-nums;
+  }
+  .stats .stat {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .stats .stat-val {
+    font-size: 6vh;
+    font-weight: 700;
+  }
+  .stats .stat-label {
+    font-size: 2.2vh;
+    color: var(--fg-subtle);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-top: 0.5vh;
+  }
+
+  .stage[data-state="offline"]  { background: var(--bg-offline); }
+  .stage[data-state="offline"] .headline { color: var(--fg-subtle); font-weight: 400; font-size: 10vh; }
+  .stage[data-state="disarmed"] { background: var(--bg-disarmed); }
+  .stage[data-state="disarmed"] .headline { color: var(--fg-subtle); font-weight: 400; font-size: 12vh; }
+  .stage[data-state="ready"]    { background: var(--bg-ready); }
+  .stage[data-state="ready"] .headline { animation: subtle-pulse 1.6s ease-in-out infinite; }
+  .stage[data-state="rejected"] {
+    background: var(--bg-rejected);
+    animation: rejected-flash 400ms ease-out;
+  }
+  .stage[data-state="rejected"] .headline { color: #ffe4e4; }
+  .stage[data-state="uploading"] { background: var(--bg-uploading); }
+  .stage[data-state="uploading"] .headline { animation: subtle-pulse 1s ease-in-out infinite; }
+  .stage[data-state="result"] {
+    background: var(--bg-result);
+    animation: result-flash 300ms ease-out;
+  }
+  .stage[data-state="result"] .headline { color: #d8ffe4; }
+  .stage[data-state="failed"]   { background: var(--bg-failed); }
+  .stage[data-state="failed"] .headline { color: #ffe4e4; }
+
+  @keyframes subtle-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.78; }
+  }
+  @keyframes rejected-flash {
+    0% { background: #ff4040; }
+    100% { background: var(--bg-rejected); }
+  }
+  @keyframes result-flash {
+    0% { background: #4ce070; }
+    100% { background: var(--bg-result); }
+  }
+</style>
+</head>
+<body>
+
+<div class="stage" data-state="offline" id="stage">
+  <div class="topstrip">
+    <div class="session" id="topL"><a href="/view">← view</a></div>
+    <div class="bulbs" id="topR">
+      <div class="bulb" id="bPhone" title="phone connected"></div>
+      <div class="bulb" id="bSession" title="session active"></div>
+      <div class="bulb" id="bAnnot" title="annotation ready"></div>
+    </div>
+  </div>
+  <div class="center">
+    <div class="headline" id="headline">Connecting…</div>
+    <div class="sub" id="sub">awaiting server</div>
+    <div class="stats" id="stats" style="display:none">
+      <div class="stat"><div class="stat-val" id="statA">—</div><div class="stat-label" id="statLA">—</div></div>
+      <div class="stat"><div class="stat-val" id="statB">—</div><div class="stat-label" id="statLB">—</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const stage = document.getElementById('stage');
+const headline = document.getElementById('headline');
+const sub = document.getElementById('sub');
+const stats = document.getElementById('stats');
+const statA = document.getElementById('statA');
+const statB = document.getElementById('statB');
+const statLA = document.getElementById('statLA');
+const statLB = document.getElementById('statLB');
+const topL = document.getElementById('topL');
+const bPhone = document.getElementById('bPhone');
+const bSession = document.getElementById('bSession');
+const bAnnot = document.getElementById('bAnnot');
+
+let session = { id: null, shotCount: 0, phone: false, active: false, annot: false };
+let armed = false;
+let lastSims = { release: null, impact: null };
+let revertTimer = null;
+
+function setBulbs() {
+  bPhone.className = 'bulb ' + (session.phone ? 'ok' : 'bad');
+  bSession.className = 'bulb ' + (session.active ? 'ok' : 'bad');
+  bAnnot.className = 'bulb ' + (session.annot ? 'ok' : 'warn');
+}
+
+function topstripText(extraShot) {
+  const parts = [];
+  if (session.id) parts.push(session.id);
+  const n = extraShot != null ? extraShot : session.shotCount;
+  parts.push(`SHOT ${n}`);
+  topL.innerHTML = `<a href="/view">← view</a> · ${parts.join(' · ')}`;
+}
+
+function setState(s, opts = {}) {
+  if (revertTimer) { clearTimeout(revertTimer); revertTimer = null; }
+  stage.dataset.state = s;
+  headline.textContent = opts.head || '';
+  sub.textContent = opts.sub || '';
+  if (opts.statsShow) {
+    stats.style.display = '';
+    statA.textContent = opts.statA;
+    statLA.textContent = opts.labelA;
+    statB.textContent = opts.statB;
+    statLB.textContent = opts.labelB;
+  } else {
+    stats.style.display = 'none';
+  }
+  if (opts.revertMs) {
+    revertTimer = setTimeout(() => goIdle(), opts.revertMs);
+  }
+}
+
+function goIdle() {
+  if (!session.active) {
+    setState('offline', { head: 'No session', sub: 'start one in /view' });
+    return;
+  }
+  if (armed) {
+    setState('ready', { head: 'FIRE', sub: 'armed — waiting for release' });
+  } else {
+    setState('disarmed', { head: 'Press SHOT to arm', sub: `${session.id || ''} · ${session.shotCount} shots` });
+  }
+}
+
+// ===== WS =====
+let ws = null;
+let reconnectMs = 1000;
+
+function connect() {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/view');
+  ws.onopen = () => { reconnectMs = 1000; };
+  ws.onmessage = (e) => {
+    let msg; try { msg = JSON.parse(e.data); } catch { return; }
+    handle(msg);
+  };
+  ws.onclose = () => {
+    setState('offline', { head: 'Disconnected', sub: 'reconnecting…' });
+    setTimeout(connect, reconnectMs);
+    reconnectMs = Math.min(reconnectMs * 2, 8000);
+  };
+  ws.onerror = () => { try { ws.close(); } catch {} };
+}
+
+function handle(msg) {
+  if (msg.type === 'state') {
+    session.id = msg.session_id;
+    session.active = !!msg.active;
+    session.phone = !!msg.phone_connected;
+    session.annot = !!msg.has_annotation;
+    session.shotCount = msg.shot_count || 0;
+    setBulbs();
+    topstripText();
+    if (stage.dataset.state === 'offline' || stage.dataset.state === 'disarmed' || stage.dataset.state === 'ready') {
+      goIdle();
+    }
+  } else if (msg.type === 'armed') {
+    armed = true;
+    goIdle();
+  } else if (msg.type === 'disarmed') {
+    armed = false;
+    goIdle();
+  } else if (msg.type === 'sound_match_result') {
+    lastSims.release = msg.release_sim;
+    lastSims.impact = msg.impact_sim;
+    if (msg.accept) return;  // wait for shot_uploaded
+    const r = fmt(msg.release_sim);
+    const i = fmt(msg.impact_sim);
+    setState('rejected', {
+      head: 'Rejected',
+      sub: 'sound did not match release/impact template',
+      statsShow: true,
+      statA: r, labelA: 'release sim',
+      statB: i, labelB: 'impact sim',
+      revertMs: 2200,
+    });
+  } else if (msg.type === 'shot_uploaded') {
+    topstripText(msg.shot);
+    const showSims = lastSims.release != null && lastSims.impact != null;
+    setState('uploading', {
+      head: `Shot ${msg.shot}`,
+      sub: 'processing…',
+      statsShow: showSims,
+      statA: showSims ? fmt(lastSims.release) : '',
+      labelA: 'release sim',
+      statB: showSims ? fmt(lastSims.impact) : '',
+      labelB: 'impact sim',
+    });
+  } else if (msg.type === 'shot_ready') {
+    const shot = msg.shot;
+    // Pull stats from msg.trajectory if present
+    const t = msg.trajectory || {};
+    const speed = t.speed_audio_ms;
+    const flightS = (t.audio_release_s != null && t.audio_impact_s != null)
+      ? (t.audio_impact_s - t.audio_release_s) : null;
+    const haveSpeed = speed != null && isFinite(speed);
+    const haveFlight = flightS != null && isFinite(flightS);
+    setState('result', {
+      head: `✓ Shot ${shot}`,
+      sub: `${t.detections_kept ?? '?'} detections`,
+      statsShow: haveSpeed || haveFlight,
+      statA: haveSpeed ? speed.toFixed(1) : '—',
+      labelA: 'm/s',
+      statB: haveFlight ? Math.round(flightS * 1000) : '—',
+      labelB: 'ms flight',
+      revertMs: 2200,
+    });
+    session.shotCount = Math.max(session.shotCount, shot);
+  } else if (msg.type === 'shot_failed') {
+    setState('failed', {
+      head: `✗ Shot ${msg.shot}`,
+      sub: msg.reason || 'failed — check corridor / annotation',
+      revertMs: 2500,
+    });
+  }
+}
+
+function fmt(v) { return v == null ? '—' : Number(v).toFixed(2); }
+
+// Optional: keyboard shortcut for fullscreen
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'f' || e.key === 'F') {
+    if (!document.fullscreenElement) document.documentElement.requestFullscreen();
+    else document.exitFullscreen();
+  }
+});
+
+connect();
+</script>
+
+</body>
+</html>
