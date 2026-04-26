@@ -175,7 +175,7 @@ def _persist_session() -> None:
         SESSION_STATE_FILE.unlink(missing_ok=True)
         return
     SESSION_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    data = {k: s.get(k) for k in ("id", "stem", "created_at", "range", "calibration_frame", "annotation", "shot_count", "fake_source", "shots", "sound_template", "sound_match_threshold")}
+    data = {k: s.get(k) for k in ("id", "stem", "created_at", "range", "calibration_frame", "annotation", "shot_count", "fake_source", "shots", "sound_template", "sound_match_threshold", "flight_anchor_offset_s")}
     SESSION_STATE_FILE.write_text(json.dumps(data, indent=2))
 
 
@@ -187,7 +187,7 @@ def _load_persisted_session() -> None:
     except Exception:
         return
     s = _new_session()
-    for k in ("id", "stem", "created_at", "range", "calibration_frame", "annotation", "shot_count", "fake_source", "shots", "sound_template", "sound_match_threshold"):
+    for k in ("id", "stem", "created_at", "range", "calibration_frame", "annotation", "shot_count", "fake_source", "shots", "sound_template", "sound_match_threshold", "flight_anchor_offset_s"):
         if k in data:
             s[k] = data[k]
     # Recover shots from on-disk trajectories if persisted list is empty
@@ -279,6 +279,19 @@ def _session_threshold(s: dict | None) -> float:
     return float(v) if v is not None else SOUND_MATCH_THRESHOLD
 
 
+def _flight_anchor_offset_s(s: dict | None) -> float:
+    """When > 0, the flight-window calc anchors on `audio_impact_s` and treats
+    the virtual release as `audio_impact_s - offset`, ignoring the phone's
+    reported `audio_release_s`. Use when impact templates are reliable but
+    release templates lag (e.g. trained on bow-string follow-through ringing
+    instead of the quiet initial release transient). Setting to 0 disables
+    the override and uses the raw release/impact pair as reported."""
+    if not s:
+        return 0.0
+    v = s.get("flight_anchor_offset_s")
+    return float(v) if v is not None else 0.0
+
+
 def _session_snapshot() -> dict:
     s = LIVE_STATE["session"]
     return {
@@ -294,6 +307,7 @@ def _session_snapshot() -> dict:
         "fake_source": s["fake_source"] if s else None,
         "shots": s["shots"] if s else [],
         "sound_match_threshold": _session_threshold(s),
+        "flight_anchor_offset_s": _flight_anchor_offset_s(s),
     }
 
 
@@ -388,6 +402,25 @@ async def api_session_sound_match_threshold(t: SoundMatchThreshold) -> dict:
     _persist_session()
     await _broadcast_view({"type": "state", **_session_snapshot()})
     return {"ok": True, "threshold": val}
+
+
+class FlightAnchorOffset(BaseModel):
+    offset_s: float
+
+
+@app.put("/api/session/flight-anchor-offset")
+async def api_session_flight_anchor_offset(t: FlightAnchorOffset) -> dict:
+    """Per-session override for impact-anchored flight windowing. When > 0,
+    server treats virtual release as `audio_impact_s - offset_s` for the
+    flight window calc, ignoring the phone-reported release timestamp.
+    Useful when impact templates fire reliably but release templates lag.
+    Clamped to [0.0, 1.0] s."""
+    s = _require_session()
+    val = max(0.0, min(1.0, float(t.offset_s)))
+    s["flight_anchor_offset_s"] = val
+    _persist_session()
+    await _broadcast_view({"type": "state", **_session_snapshot()})
+    return {"ok": True, "offset_s": val}
 
 
 @app.delete("/api/session/calibration")
@@ -1502,11 +1535,29 @@ async def _process_shot(
             audio_events.get("release_s") is not None
             and audio_events.get("impact_s") is not None
         ):
-            a_guess = int(round(audio_events["release_s"] * fps_probe))
-            b_guess = int(round(audio_events["impact_s"] * fps_probe))
-            # 2-frame pad each side covers audio/video alignment jitter.
-            a = max(0, a_guess - 2)
-            b = min(max(total_frames, 1) - 1, b_guess + 2)
+            # Impact-anchored override. When the session has a non-zero
+            # `flight_anchor_offset_s`, treat the impact timestamp as ground
+            # truth and back-derive the flight window's start from it. Used
+            # when impact templates fire reliably but release templates lag
+            # (e.g. trained on follow-through ringing instead of the quieter
+            # initial release transient — the bug we hit on shot 61).
+            anchor_offset = _flight_anchor_offset_s(LIVE_STATE["session"])
+            if anchor_offset > 0:
+                impact_s = float(audio_events["impact_s"])
+                # Slightly wider pad than the 2-frame audio/video jitter case
+                # because the offset is approximate (different draw weights
+                # produce 250-350 ms flight times).
+                pad_s = 0.05
+                a_guess = int(round((impact_s - anchor_offset - pad_s) * fps_probe))
+                b_guess = int(round((impact_s + pad_s) * fps_probe))
+            else:
+                a_guess = int(round(audio_events["release_s"] * fps_probe))
+                b_guess = int(round(audio_events["impact_s"] * fps_probe))
+                # 2-frame pad each side covers audio/video alignment jitter.
+                a_guess -= 2
+                b_guess += 2
+            a = max(0, a_guess)
+            b = min(max(total_frames, 1) - 1, b_guess)
             if b > a:
                 flight_source = "audio"
         if flight_source == "none":

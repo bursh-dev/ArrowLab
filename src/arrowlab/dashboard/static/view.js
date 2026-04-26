@@ -307,6 +307,56 @@ soundThresholdSaveBtn.addEventListener("click", async () => {
   }
 });
 
+// ===== Flight-anchor offset =====
+const flightOffsetSlider = document.getElementById("flightOffsetSlider");
+const flightOffsetValue = document.getElementById("flightOffsetValue");
+const flightOffsetSaveBtn = document.getElementById("flightOffsetSaveBtn");
+const flightOffsetStatus = document.getElementById("flightOffsetStatus");
+
+let serverFlightOffset = 0.0;
+
+function setFlightOffsetSlider(v, { fromServer = false } = {}) {
+  const n = Number(v);
+  if (!isFinite(n)) return;
+  flightOffsetSlider.value = n.toFixed(2);
+  flightOffsetValue.textContent = n.toFixed(2);
+  if (fromServer) serverFlightOffset = n;
+  flightOffsetSaveBtn.disabled = Math.abs(n - serverFlightOffset) < 0.005;
+}
+
+flightOffsetSlider.addEventListener("input", () => {
+  setFlightOffsetSlider(flightOffsetSlider.value);
+});
+
+flightOffsetSaveBtn.addEventListener("click", async () => {
+  const v = Number(flightOffsetSlider.value);
+  flightOffsetSaveBtn.disabled = true;
+  flightOffsetStatus.textContent = "saving…";
+  try {
+    const res = await fetch("/api/session/flight-anchor-offset", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ offset_s: v }),
+    });
+    if (!res.ok) {
+      flightOffsetStatus.textContent = "save failed: " + await res.text();
+      flightOffsetSaveBtn.disabled = false;
+      return;
+    }
+    const j = await res.json();
+    serverFlightOffset = j.offset_s;
+    flightOffsetStatus.textContent = j.offset_s > 0
+      ? `impact-anchored · −${j.offset_s.toFixed(2)} s`
+      : "off (raw release/impact pair)";
+    setFlightOffsetSlider(j.offset_s, { fromServer: true });
+    setTimeout(() => { flightOffsetStatus.textContent = ""; }, 3000);
+    logLive(`flight anchor offset → ${j.offset_s.toFixed(2)}s`, "ok");
+  } catch (e) {
+    flightOffsetStatus.textContent = "save error: " + e.message;
+    flightOffsetSaveBtn.disabled = false;
+  }
+});
+
 function pushThresholdFeed(msg) {
   // Keep at most 20 rows; newest on top.
   const empty = soundThresholdFeed.querySelector(".shoot-hint");
@@ -493,6 +543,14 @@ function applyState(st) {
       // Slider has unsaved local edits; just update the disabled state of
       // Save by re-evaluating the diff.
       soundThresholdSaveBtn.disabled = false;
+    }
+  }
+  if (typeof st.flight_anchor_offset_s === "number") {
+    serverFlightOffset = st.flight_anchor_offset_s;
+    if (Math.abs(Number(flightOffsetSlider.value) - serverFlightOffset) < 0.005) {
+      setFlightOffsetSlider(serverFlightOffset, { fromServer: true });
+    } else {
+      flightOffsetSaveBtn.disabled = false;
     }
   }
   setBulb(bulbPhone, st.phone_connected,

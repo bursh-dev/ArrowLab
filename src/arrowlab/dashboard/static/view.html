@@ -223,6 +223,13 @@
           <button id="soundThresholdSaveBtn" disabled>Save</button>
           <span id="soundThresholdStatus" class="shoot-hint"></span>
         </div>
+        <div class="sound-threshold-row">
+          <label for="flightOffsetSlider" title="When > 0, server anchors flight window on impact and back-derives release as impact-offset, ignoring the phone's release timestamp. Useful when impact is reliable but release lags. Set to 0 to disable.">Impact-anchored offset (s)</label>
+          <input type="range" id="flightOffsetSlider" min="0.00" max="0.50" step="0.01" value="0.00" />
+          <span id="flightOffsetValue" class="sound-threshold-val">0.00</span>
+          <button id="flightOffsetSaveBtn" disabled>Save</button>
+          <span id="flightOffsetStatus" class="shoot-hint"></span>
+        </div>
         <div class="sound-threshold-feed" id="soundThresholdFeed">
           <div class="shoot-hint">recent sound-match events appear here once you fire shots</div>
         </div>
